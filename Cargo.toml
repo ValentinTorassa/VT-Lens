@@ -1,0 +1,9 @@
+[package]
+name = "vt-lens"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "A minimal native lens for understanding local process and network activity."
+
+[dependencies]
+eframe = "0.27"
