@@ -14,6 +14,7 @@ impl ProcessRow {
         self.rss_kb as f64 / 1024.0
     }
 
+    #[allow(dead_code)]
     pub fn label(&self) -> String {
         format!("{} ({})", self.name, self.pid)
     }
