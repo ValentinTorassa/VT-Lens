@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=VT Lens
+Comment=Observabilidad y seguridad de procesos y sockets activos
+Exec=vt-lens
+Icon=system-monitoring
+Terminal=false
+Categories=System;Monitor;Security;Utility;

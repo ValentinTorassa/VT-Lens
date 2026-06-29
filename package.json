@@ -1,0 +1,24 @@
+{
+  "name": "vt-lens",
+  "version": "0.1.0",
+  "description": "Local system visibility - /proc based native tool",
+  "bin": {
+    "vt-lens": "bin/vt-lens"
+  },
+  "scripts": {
+    "postinstall": "cargo build --release && mkdir -p bin && cp target/release/vt-lens bin/vt-lens"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ValentinTorassa/vt-lens.git"
+  },
+  "keywords": [
+    "observability",
+    "security",
+    "linux",
+    "network",
+    "sockets"
+  ],
+  "author": "Valentin Torassa",
+  "license": "GPL-3.0-only"
+}
