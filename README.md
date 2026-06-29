@@ -10,17 +10,6 @@ This is an educational instrument, not a packet sniffer or an EDR. The MVP uses
 Linux `/proc` connection tables, so it shows process and connection metadata
 without requiring root access.
 
-## MVP Features
-
-- Native minimal GUI with `egui` / `eframe`.
-- Live process table: PID, name, command line, memory, threads, socket count.
-- Live network table: protocol, owner process, local address, remote address,
-  connection state, queue sizes, socket inode.
-- Process focus: click a process to filter its network activity.
-- LLM analysis workspace: build a prompt from the selected process/network
-  slice.
-- Markdown evidence export for labs, writeups, and videos.
-
 ## Instalación (Installation)
 
 ### 1. Dependencias del Sistema
@@ -92,6 +81,19 @@ Si tienes el entorno de desarrollo de Rust configurado y quieres compilar e inst
 ```bash
 cargo install --path .
 ```
+
+---
+
+## MVP Features
+
+- Native minimal GUI with `egui` / `eframe`.
+- Live process table: PID, name, command line, memory, threads, socket count.
+- Live network table: protocol, owner process, local address, remote address,
+  connection state, queue sizes, socket inode.
+- Process focus: click a process to filter its network activity.
+- LLM analysis workspace: build a prompt from the selected process/network
+  slice.
+- Markdown evidence export for labs, writeups, and videos.
 
 ---
 
