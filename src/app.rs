@@ -74,6 +74,11 @@ pub struct ProcSnapshot {
     pub status: String,
 }
 
+struct DnsRequest {
+    ip: String,
+    ctx: egui::Context,
+}
+
 pub struct VtLensApp {
     processes: Vec<ProcessRow>,
     connections: Vec<NetRow>,
@@ -106,6 +111,10 @@ pub struct VtLensApp {
     metric_listening_count: usize,
     metric_udp_multicast_count: usize,
     last_snapshot_time: Instant,
+    // DNS Resolution
+    dns_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    dns_resolving: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    tx_dns: std::sync::mpsc::Sender<DnsRequest>,
 }
 
 impl VtLensApp {
@@ -157,6 +166,46 @@ impl VtLensApp {
             }
         });
 
+        // Spawn background DNS resolver thread
+        let (tx_dns, rx_dns) = std::sync::mpsc::channel::<DnsRequest>();
+        let dns_cache = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let dns_resolving = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
+        let dns_cache_clone = dns_cache.clone();
+        let dns_resolving_clone = dns_resolving.clone();
+        std::thread::spawn(move || {
+            while let Ok(request) = rx_dns.recv() {
+                let ip_str = request.ip.clone();
+                let (clean_ip, port_suffix) = if let Some(pos) = ip_str.find(':') {
+                    (&ip_str[..pos], &ip_str[pos..])
+                } else {
+                    (&ip_str[..], "")
+                };
+
+                if let Ok(ip_addr) = clean_ip.parse::<std::net::IpAddr>() {
+                    match dns_lookup::lookup_addr(&ip_addr) {
+                        Ok(hostname) => {
+                            let display_name = format!("{}{}", hostname, port_suffix);
+                            if let Ok(mut cache) = dns_cache_clone.lock() {
+                                cache.insert(ip_str.clone(), display_name);
+                            }
+                        }
+                        Err(_) => {
+                            // If resolution fails, store it mapped to itself to avoid repeated retries
+                            if let Ok(mut cache) = dns_cache_clone.lock() {
+                                cache.insert(ip_str.clone(), ip_str.clone());
+                            }
+                        }
+                    }
+                }
+
+                if let Ok(mut resolving) = dns_resolving_clone.lock() {
+                    resolving.remove(&ip_str);
+                }
+                request.ctx.request_repaint();
+            }
+        });
+
         let mut app = Self {
             processes: Vec::new(),
             connections: Vec::new(),
@@ -187,6 +236,9 @@ impl VtLensApp {
             metric_listening_count: 0,
             metric_udp_multicast_count: 0,
             last_snapshot_time: Instant::now(),
+            dns_cache,
+            dns_resolving,
+            tx_dns,
         };
 
         app.update_caches();
@@ -1037,14 +1089,32 @@ impl VtLensApp {
                             let r_local = ui.selectable_label(selected, RichText::new(&connection.local_addr).monospace().size(11.0));
                             if r_local.clicked() || r_local.double_clicked() { clicked = true; }
 
-                            // Remote Addr cell with external/localhost highlighting
+                            // Remote Addr cell with external/localhost highlighting and DNS resolution
                             let remote_class = Self::classify_endpoint(&connection.remote_addr);
+                            let resolved_addr = if let Ok(cache) = self.dns_cache.lock() {
+                                cache.get(&connection.remote_addr).cloned().unwrap_or_else(|| {
+                                    if remote_class == EndpointClass::External || remote_class == EndpointClass::PrivateLan {
+                                        if let Ok(mut resolving) = self.dns_resolving.lock() {
+                                            if resolving.insert(connection.remote_addr.clone()) {
+                                                let _ = self.tx_dns.send(DnsRequest {
+                                                    ip: connection.remote_addr.clone(),
+                                                    ctx: ui.ctx().clone(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    connection.remote_addr.clone()
+                                })
+                            } else {
+                                connection.remote_addr.clone()
+                            };
+
                             let remote_text = match remote_class {
-                                EndpointClass::Localhost => RichText::new(&connection.remote_addr).weak().monospace().size(11.0),
-                                EndpointClass::Multicast => RichText::new(format!("{} 📢", connection.remote_addr)).weak().monospace().size(11.0),
-                                EndpointClass::PrivateLan => RichText::new(format!("{} 🏠", connection.remote_addr)).weak().monospace().size(11.0),
-                                EndpointClass::External => RichText::new(format!("{} 🌐", connection.remote_addr)).monospace().size(11.0).color(egui::Color32::from_rgb(14, 165, 233)),
-                                _ => RichText::new(&connection.remote_addr).monospace().size(11.0),
+                                EndpointClass::Localhost => RichText::new(&resolved_addr).weak().monospace().size(11.0),
+                                EndpointClass::Multicast => RichText::new(format!("{} 📢", resolved_addr)).weak().monospace().size(11.0),
+                                EndpointClass::PrivateLan => RichText::new(format!("{} 🏠", resolved_addr)).weak().monospace().size(11.0),
+                                EndpointClass::External => RichText::new(format!("{} 🌐", resolved_addr)).monospace().size(11.0).color(egui::Color32::from_rgb(14, 165, 233)),
+                                _ => RichText::new(&resolved_addr).monospace().size(11.0),
                             };
                             let r_remote = ui.selectable_label(selected, remote_text);
                             if r_remote.clicked() || r_remote.double_clicked() { clicked = true; }
@@ -1147,7 +1217,21 @@ impl VtLensApp {
                                 ui.label(RichText::new(&conn.local_addr).monospace().size(11.0));
                                 ui.add_space(2.0);
                                 ui.label(RichText::new("Remoto:").weak().size(9.0));
-                                ui.label(RichText::new(&conn.remote_addr).monospace().size(11.0));
+                                let resolved = if let Ok(cache) = self.dns_cache.lock() {
+                                    cache.get(&conn.remote_addr).cloned()
+                                } else {
+                                    None
+                                };
+                                
+                                if let Some(dns) = resolved {
+                                    if dns != conn.remote_addr {
+                                        ui.label(RichText::new(format!("{} ({})", dns, conn.remote_addr)).monospace().size(11.0));
+                                    } else {
+                                        ui.label(RichText::new(&conn.remote_addr).monospace().size(11.0));
+                                    }
+                                } else {
+                                    ui.label(RichText::new(&conn.remote_addr).monospace().size(11.0));
+                                }
                                 ui.add_space(4.0);
                                 
                                 let class = Self::classify_endpoint(&conn.remote_addr);
