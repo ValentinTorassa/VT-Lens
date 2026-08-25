@@ -79,6 +79,12 @@ struct DnsRequest {
     ctx: egui::Context,
 }
 
+enum LlmMessage {
+    Start,
+    Chunk(String),
+    End(Result<(), String>),
+}
+
 pub struct VtLensApp {
     processes: Vec<ProcessRow>,
     connections: Vec<NetRow>,
@@ -99,8 +105,8 @@ pub struct VtLensApp {
     analysis_result: String,
     analysis_loading: bool,
     net_filter_type: NetFilterType,
-    tx_analysis: std::sync::mpsc::Sender<Result<String, String>>,
-    rx_analysis: std::sync::mpsc::Receiver<Result<String, String>>,
+    tx_analysis: std::sync::mpsc::Sender<LlmMessage>,
+    rx_analysis: std::sync::mpsc::Receiver<LlmMessage>,
     only_network_active: bool,
     // Performance Optimization Caches
     filtered_processes_cache: Vec<ProcessRow>,
@@ -811,6 +817,7 @@ impl VtLensApp {
                                         self.api_key.clone(),
                                         self.build_prompt(),
                                         self.tx_analysis.clone(),
+                                        ui.ctx().clone(),
                                     );
                                 }
                             });
@@ -845,6 +852,7 @@ impl VtLensApp {
                                         self.api_key.clone(),
                                         self.build_prompt(),
                                         self.tx_analysis.clone(),
+                                        ui.ctx().clone(),
                                     );
                                 }
                             }
@@ -1398,6 +1406,7 @@ impl VtLensApp {
                                 self.api_key.clone(),
                                 self.explain_prompt.clone(),
                                 self.tx_analysis.clone(),
+                                ui.ctx().clone(),
                             );
                         }
                     }
@@ -1484,16 +1493,24 @@ impl eframe::App for VtLensApp {
         }
 
         // Poll for LLM analysis results
-        if let Ok(result) = self.rx_analysis.try_recv() {
-            self.analysis_loading = false;
-            match result {
-                Ok(content) => {
-                    self.analysis_result = content;
+        while let Ok(msg) = self.rx_analysis.try_recv() {
+            match msg {
+                LlmMessage::Start => {
+                    self.analysis_loading = true;
+                    self.analysis_result.clear();
                 }
-                Err(err) => {
+                LlmMessage::Chunk(chunk) => {
+                    self.analysis_result.push_str(&chunk);
+                }
+                LlmMessage::End(Ok(())) => {
+                    self.analysis_loading = false;
+                }
+                LlmMessage::End(Err(err)) => {
+                    self.analysis_loading = false;
                     self.analysis_result = format!("Error: {err}");
                 }
             }
+            ctx.request_repaint();
         }
 
         ctx.request_repaint_after(Duration::from_millis(500));
@@ -1574,20 +1591,33 @@ fn run_llm_analysis(
     model_name: String,
     api_key: String,
     prompt: String,
-    tx: std::sync::mpsc::Sender<Result<String, String>>,
+    tx: std::sync::mpsc::Sender<LlmMessage>,
+    ctx: egui::Context,
 ) {
     std::thread::spawn(move || {
-        let result = perform_llm_request(provider, model_name, api_key, prompt);
-        let _ = tx.send(result);
+        let _ = tx.send(LlmMessage::Start);
+        ctx.request_repaint();
+
+        match perform_llm_stream_request(provider, model_name, api_key, prompt, &tx, &ctx) {
+            Ok(()) => {
+                let _ = tx.send(LlmMessage::End(Ok(())));
+            }
+            Err(err) => {
+                let _ = tx.send(LlmMessage::End(Err(err)));
+            }
+        }
+        ctx.request_repaint();
     });
 }
 
-fn perform_llm_request(
+fn perform_llm_stream_request(
     provider: LlmProvider,
     model_name: String,
     api_key: String,
     prompt: String,
-) -> Result<String, String> {
+    tx: &std::sync::mpsc::Sender<LlmMessage>,
+    ctx: &egui::Context,
+) -> Result<(), String> {
     let url = provider.default_url();
     let mut request = ureq::post(url);
 
@@ -1633,7 +1663,8 @@ fn perform_llm_request(
                         "role": "user",
                         "content": prompt
                     }
-                ]
+                ],
+                "stream": true
             })
         }
         LlmProvider::Anthropic => {
@@ -1645,7 +1676,8 @@ fn perform_llm_request(
                         "role": "user",
                         "content": prompt
                     }
-                ]
+                ],
+                "stream": true
             })
         }
         LlmProvider::Ollama => {
@@ -1657,7 +1689,7 @@ fn perform_llm_request(
                         "content": prompt
                     }
                 ],
-                "stream": false
+                "stream": true
             })
         }
     };
@@ -1672,30 +1704,53 @@ fn perform_llm_request(
         return Err(format!("Server returned status {status}: {err_body}"));
     }
 
-    let json_resp: serde_json::Value = response
-        .into_json()
-        .map_err(|err| format!("Failed to parse response JSON: {err}"))?;
+    let reader = std::io::BufReader::new(response.into_reader());
 
-    match provider {
-        LlmProvider::OpenRouter | LlmProvider::OpenAI => {
-            let content = json_resp["choices"][0]["message"]["content"]
-                .as_str()
-                .ok_or_else(|| format!("Invalid response format: {json_resp}"))?;
-            Ok(content.to_string())
+    use std::io::BufRead;
+    for line_result in reader.lines() {
+        let line = line_result.map_err(|err| format!("Failed to read stream line: {err}"))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
         }
-        LlmProvider::Anthropic => {
-            let content = json_resp["content"][0]["text"]
-                .as_str()
-                .ok_or_else(|| format!("Invalid response format: {json_resp}"))?;
-            Ok(content.to_string())
-        }
-        LlmProvider::Ollama => {
-            let content = json_resp["message"]["content"]
-                .as_str()
-                .ok_or_else(|| format!("Invalid response format: {json_resp}"))?;
-            Ok(content.to_string())
+
+        // Standard SSE event line: "data: {JSON}"
+        if trimmed.starts_with("data: ") {
+            let data_str = &trimmed["data: ".len()..];
+            if data_str.trim() == "[DONE]" {
+                break;
+            }
+
+            if let Ok(json_chunk) = serde_json::from_str::<serde_json::Value>(data_str) {
+                let chunk_text = match provider {
+                    LlmProvider::OpenRouter | LlmProvider::OpenAI => {
+                        json_chunk["choices"][0]["delta"]["content"].as_str().map(|s| s.to_string())
+                    }
+                    LlmProvider::Anthropic => {
+                        json_chunk["delta"]["text"].as_str().map(|s| s.to_string())
+                    }
+                    LlmProvider::Ollama => {
+                        json_chunk["message"]["content"].as_str().map(|s| s.to_string())
+                    }
+                };
+
+                if let Some(text) = chunk_text {
+                    let _ = tx.send(LlmMessage::Chunk(text));
+                    ctx.request_repaint();
+                }
+            }
+        } else if provider == LlmProvider::Ollama {
+            // Ollama might output raw JSON line directly
+            if let Ok(json_chunk) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Some(text) = json_chunk["message"]["content"].as_str() {
+                    let _ = tx.send(LlmMessage::Chunk(text.to_string()));
+                    ctx.request_repaint();
+                }
+            }
         }
     }
+
+    Ok(())
 }
 
 pub fn capture_system_snapshot() -> ProcSnapshot {
@@ -1724,5 +1779,4 @@ pub fn capture_system_snapshot() -> ProcSnapshot {
         status,
     }
 }
-
 
