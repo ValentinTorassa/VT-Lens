@@ -133,3 +133,12 @@ with `rustfmt`.
 ## License
 
 GPL-3.0-only.
+
+## Verificación de regresiones — 2026-09-14
+
+```bash
+cargo test --locked
+cargo build --locked
+```
+
+GitHub Actions verifica en Linux con las dependencias gráficas documentadas. Hasta cerrar el resultado de software activo en VT-Tasks, mantener el alcance del MVP: visualización local de procesos y conexiones.
