@@ -134,7 +134,7 @@ with `rustfmt`.
 
 GPL-3.0-only.
 
-## Verificación de regresiones — 2026-09-14
+## Verificación de regresiones - 2026-09-14
 
 ```bash
 cargo test --locked
