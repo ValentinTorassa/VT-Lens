@@ -1,0 +1,138 @@
+name: Release
+
+# Pushing a tag like v0.2.0 builds the prebuilt binaries and publishes them as a
+# GitHub release. Running it by hand (workflow_dispatch) is a dry run: it builds
+# and uploads the same files as workflow artifacts but publishes nothing.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pinned instead of ubuntu-latest: the latest image moves to Ubuntu 26
+          # on 2026-10-19 and the apt package names below may change with it.
+          # The binary links against this image's glibc (2.39).
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          # Linux only: the app reads /proc, which macOS doesn't have, so a
+          # macOS binary would install fine and show empty tables.
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve release name
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            tag="$REF_NAME"
+            crate_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+            if [ "$tag" != "v$crate_version" ]; then
+              echo "::error::Tag $tag does not match Cargo.toml version $crate_version (expected v$crate_version)."
+              exit 1
+            fi
+          else
+            tag="dryrun-${GITHUB_SHA::7}"
+          fi
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Install GUI build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # No build cache: a release binary is always built from a clean tree.
+
+      - run: cargo build --release --locked
+
+      - name: Package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="vt-lens-${RELEASE_TAG}-${TARGET}"
+          mkdir -p "dist/$name"
+          cp target/release/vt-lens "dist/$name/"
+          for f in README.md LICENSE vt-lens.desktop; do
+            if [ -f "$f" ]; then cp "$f" "dist/$name/"; fi
+          done
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -rf "dist/$name"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  checksums:
+    name: Checksums
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: checksums
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            prerelease=()
+            case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
+            gh release create "$TAG" dist/* --verify-tag --title "$TAG" --generate-notes "${prerelease[@]}"
+          fi

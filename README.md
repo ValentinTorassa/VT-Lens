@@ -12,8 +12,8 @@ without requiring root access.
 
 ## Instalación (Installation)
 
-### 1. Dependencias del Sistema
-Para poder compilar la interfaz gráfica nativa con `egui/eframe`, necesitas tener instaladas las dependencias de desarrollo correspondientes a tu distribución de Linux:
+### 1. Dependencias del Sistema (solo para compilar)
+Si instalas el binario precompilado (ver punto 2) no necesitas Rust ni estas dependencias. Para compilar la interfaz gráfica nativa con `egui/eframe` desde el código fuente, necesitas las dependencias de desarrollo correspondientes a tu distribución de Linux:
 
 **Debian / Ubuntu / Mint / Pop!_OS:**
 ```bash
@@ -33,10 +33,18 @@ sudo pacman -S --needed base-devel libxcb xkbcommon openssl gtk3
 ---
 
 ### 2. Instalación Directa de una Línea (vía Curl)
-Si deseas clonar, compilar e instalar VT Lens y registrar su lanzador de escritorio de manera automatizada sin descargar manualmente el código, ejecuta:
+Para instalar VT Lens y registrar su lanzador de escritorio de manera automatizada, ejecuta:
 ```bash
 curl -sSL https://raw.githubusercontent.com/ValentinTorassa/vt-lens/main/install.sh | bash
 ```
+El script descarga el binario precompilado de la última [release](https://github.com/ValentinTorassa/VT-Lens/releases) para Linux x86_64 (glibc 2.39 o superior, p. ej. Ubuntu 24.04+), verifica su SHA256 contra `SHA256SUMS` y aborta si no coincide. Solo hay binario para Linux: la app lee `/proc`, que macOS no tiene. Si no hay binario para tu sistema, clona y compila desde el código fuente (requiere Rust y las dependencias del punto 1).
+
+Opciones (pásalas con `| bash -s -- <opciones>`):
+- `--from-source`: compila desde el código fuente aunque exista un binario precompilado.
+- `--prefix DIR`: instala en `DIR/bin` en lugar de `~/.local/bin`.
+- `--dry-run`: muestra lo que haría sin instalar nada.
+
+Cada release también publica los archivos `vt-lens-<versión>-<target>.tar.gz` para descargarlos a mano.
 
 ---
 
