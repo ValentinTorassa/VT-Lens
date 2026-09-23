@@ -189,6 +189,15 @@ fetch_prebuilt() {
         exit 1
     fi
 
+    # A binary built against a newer glibc installs fine and then refuses to
+    # start. ldd lists the missing symbol versions without running the app.
+    if command -v ldd &> /dev/null && ldd "$dir/vt-lens" 2>&1 | grep -q "not found"; then
+        echo -e "${YELLOW}El binario precompilado no es compatible con las bibliotecas de este sistema:${NC}"
+        ldd "$dir/vt-lens" 2>&1 | grep "not found" | sed 's/^/  /'
+        echo -e "${YELLOW}Se compila desde el código fuente.${NC}"
+        return 1
+    fi
+
     PREBUILT_DIR="$dir"
     return 0
 }

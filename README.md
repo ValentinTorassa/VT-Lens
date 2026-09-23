@@ -37,7 +37,7 @@ Para instalar VT Lens y registrar su lanzador de escritorio de manera automatiza
 ```bash
 curl -sSL https://raw.githubusercontent.com/ValentinTorassa/vt-lens/main/install.sh | bash
 ```
-El script descarga el binario precompilado de la última [release](https://github.com/ValentinTorassa/VT-Lens/releases) para Linux x86_64 (glibc 2.39 o superior, p. ej. Ubuntu 24.04+), verifica su SHA256 contra `SHA256SUMS` y aborta si no coincide. Solo hay binario para Linux: la app lee `/proc`, que macOS no tiene. Si no hay binario para tu sistema, clona y compila desde el código fuente (requiere Rust y las dependencias del punto 1).
+El script descarga el binario precompilado de la última [release](https://github.com/ValentinTorassa/VT-Lens/releases) para Linux x86_64 (glibc 2.35 o superior: Ubuntu 22.04+, Debian 12+), verifica su SHA256 contra `SHA256SUMS` y aborta si no coincide. Solo hay binario para Linux: la app lee `/proc`, que macOS no tiene. Si no hay binario para tu sistema, clona y compila desde el código fuente (requiere Rust y las dependencias del punto 1).
 
 Opciones (pásalas con `| bash -s -- <opciones>`):
 - `--from-source`: compila desde el código fuente aunque exista un binario precompilado.

@@ -26,8 +26,10 @@ jobs:
         include:
           # Pinned instead of ubuntu-latest: the latest image moves to Ubuntu 26
           # on 2026-10-19 and the apt package names below may change with it.
-          # The binary links against this image's glibc (2.39).
-          - os: ubuntu-24.04
+          # Built on 22.04 on purpose: the binary links against the build
+          # image's glibc (2.35 here), so it also runs on Debian 12 (2.36).
+          # On 24.04 (2.39) it installed fine on Debian 12 and failed to start.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           # Linux only: the app reads /proc, which macOS doesn't have, so a
           # macOS binary would install fine and show empty tables.
