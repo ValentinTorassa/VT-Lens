@@ -5,7 +5,7 @@ use eframe::egui::{self, RichText, TextEdit};
 
 use crate::capture::{read_connections, read_processes, socket_owners};
 use crate::model::{NetRow, ProcessRow};
-use crate::redaction::redact;
+use crate::redaction::redact_with_terms;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlmProvider {
@@ -95,6 +95,7 @@ pub struct VtLensApp {
     network_filter: String,
     explain_prompt: String,
     export_preview: String,
+    private_terms: String,
     status: String,
     auto_refresh: bool,
     tx_snapshot: std::sync::mpsc::Sender<ProcSnapshot>,
@@ -223,6 +224,7 @@ impl VtLensApp {
             network_filter: String::new(),
             explain_prompt: String::new(),
             export_preview: String::new(),
+            private_terms: String::new(),
             status: "Starting capture".to_string(),
             auto_refresh: true,
             tx_snapshot,
@@ -557,7 +559,7 @@ impl VtLensApp {
                         conn.local_addr,
                         conn.remote_addr,
                         conn.state,
-                        conn.owner_label(),
+                        conn.owner.as_ref().map(|owner| owner.pid.to_string()).unwrap_or_else(|| "unknown".to_string()),
                         conn.inode,
                         marker
                     ));
@@ -600,7 +602,7 @@ impl VtLensApp {
         );
 
         prompt.push_str("--- REDACTED EVIDENCE ---\n");
-        prompt.push_str(&redact(&self.build_ai_evidence()));
+        prompt.push_str(&redact_with_terms(&self.build_ai_evidence(), &self.private_terms));
         prompt
     }
 
@@ -647,7 +649,7 @@ impl VtLensApp {
                 markdown.push_str(&format!("- Local: `{}`\n", connection.local_addr));
                 markdown.push_str(&format!("- Remote: `{}`\n", connection.remote_addr));
                 markdown.push_str(&format!("- State: {}\n", connection.state));
-                markdown.push_str(&format!("- Owner: {}\n", connection.owner_label()));
+                markdown.push_str(&format!("- Owner PID: {}\n", connection.owner.as_ref().map(|owner| owner.pid.to_string()).unwrap_or_else(|| "unknown".to_string())));
                 markdown.push_str(&format!("- Inode: {}\n", connection.inode));
                 markdown.push_str(&format!("- Queues: tx={} rx={}\n\n", connection.tx_queue, connection.rx_queue));
             }
@@ -664,13 +666,13 @@ impl VtLensApp {
                 connection.local_addr,
                 connection.remote_addr,
                 connection.state,
-                connection.owner_label(),
+                connection.owner.as_ref().map(|owner| owner.pid.to_string()).unwrap_or_else(|| "unknown".to_string()),
                 connection.tx_queue,
                 connection.rx_queue
             ));
         }
 
-        redact(&markdown)
+        redact_with_terms(&markdown, &self.private_terms)
     }
 
     fn show_header(&mut self, ui: &mut egui::Ui) {
@@ -1411,7 +1413,7 @@ impl VtLensApp {
                                 self.provider,
                                 self.model_name.clone(),
                                 self.api_key.clone(),
-                                redact(&self.explain_prompt),
+                                redact_with_terms(&self.explain_prompt, &self.private_terms),
                                 self.tx_analysis.clone(),
                                 ui.ctx().clone(),
                             );
@@ -1461,6 +1463,8 @@ impl VtLensApp {
                 egui::CollapsingHeader::new("📝 Vista previa redactada · revisá antes de enviar o compartir")
                     .default_open(true)
                     .show(ui, |ui| {
+                    ui.label("Términos privados adicionales (separados por coma; solo esta sesión):");
+                    ui.add(TextEdit::singleline(&mut self.private_terms).desired_width(f32::INFINITY));
                     ui.horizontal(|ui| {
                         if ui.small_button("Build Prompt").clicked() {
                             self.explain_prompt = self.build_prompt();

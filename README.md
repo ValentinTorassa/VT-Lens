@@ -128,15 +128,17 @@ with `rustfmt`.
 - Do not publish exports that contain real private hosts, internal services,
   tokens, customer data, employer data, or personal network details.
 - The MVP does not capture packet payloads.
-- Prompt and Markdown previews redact command lines, common credential patterns,
-  email addresses, home paths and IP addresses. Review the preview before sending
-  or sharing: pattern matching cannot recognize every kind of private data.
+- Prompt and Markdown previews redact command lines, structured identity and
+  credential fields, email addresses, home paths and IP addresses. The preview
+  also accepts comma-separated private terms for this session; they are applied
+  again immediately before a provider request. Review the preview before
+  sending or sharing: pattern matching cannot recognize every kind of private data.
 - Provider keys are used for the request and are not written to logs.
 
 ## Roadmap
 
 1. Store provider keys locally via the OS keyring.
-2. Improve redaction with structured fields and user-defined private terms.
+2. Persist private-term preferences locally without copying them to exports.
 4. Add optional packet capture mode behind an explicit root/capability warning.
 5. Add DNS/SNI/cert-chain enrichment for the network pane.
 
