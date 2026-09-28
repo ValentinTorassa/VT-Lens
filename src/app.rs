@@ -5,6 +5,7 @@ use eframe::egui::{self, RichText, TextEdit};
 
 use crate::capture::{read_connections, read_processes, socket_owners};
 use crate::model::{NetRow, ProcessRow};
+use crate::redaction::redact;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlmProvider {
@@ -104,6 +105,7 @@ pub struct VtLensApp {
     model_name: String,
     analysis_result: String,
     analysis_loading: bool,
+    analysis_prepared: bool,
     net_filter_type: NetFilterType,
     tx_analysis: std::sync::mpsc::Sender<LlmMessage>,
     rx_analysis: std::sync::mpsc::Receiver<LlmMessage>,
@@ -230,6 +232,7 @@ impl VtLensApp {
             model_name: LlmProvider::OpenRouter.default_model().to_string(),
             analysis_result: String::new(),
             analysis_loading: false,
+            analysis_prepared: false,
             net_filter_type: NetFilterType::All,
             tx_analysis,
             rx_analysis,
@@ -596,8 +599,8 @@ impl VtLensApp {
              6. Limitaciones de esta evidencia\n\n"
         );
 
-        prompt.push_str("--- RAW EVIDENCE ---\n");
-        prompt.push_str(&self.build_ai_evidence());
+        prompt.push_str("--- REDACTED EVIDENCE ---\n");
+        prompt.push_str(&redact(&self.build_ai_evidence()));
         prompt
     }
 
@@ -667,7 +670,7 @@ impl VtLensApp {
             ));
         }
 
-        markdown
+        redact(&markdown)
     }
 
     fn show_header(&mut self, ui: &mut egui::Ui) {
@@ -1396,15 +1399,19 @@ impl VtLensApp {
                         ui.add(egui::Spinner::new());
                         ui.label("Analizando...");
                     } else {
-                        if ui.button("✨ Analizar con IA").clicked() {
+                        if ui.button("1. Preparar vista previa").clicked() {
                             self.explain_prompt = self.build_prompt();
+                            self.export_preview = self.build_markdown_export();
+                            self.analysis_prepared = true;
+                        }
+                        if self.analysis_prepared && ui.button("2. Enviar a IA").clicked() {
                             self.analysis_loading = true;
                             self.analysis_result = "Iniciando análisis...".to_string();
                             run_llm_analysis(
                                 self.provider,
                                 self.model_name.clone(),
                                 self.api_key.clone(),
-                                self.explain_prompt.clone(),
+                                redact(&self.explain_prompt),
                                 self.tx_analysis.clone(),
                                 ui.ctx().clone(),
                             );
@@ -1451,10 +1458,13 @@ impl VtLensApp {
                 ui.add_space(8.0);
 
                 // Collapsible raw evidence/prompt section
-                ui.collapsing("📝 Evidencia Cruda y Prompt", |ui| {
+                egui::CollapsingHeader::new("📝 Vista previa redactada · revisá antes de enviar o compartir")
+                    .default_open(true)
+                    .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         if ui.small_button("Build Prompt").clicked() {
                             self.explain_prompt = self.build_prompt();
+                            self.analysis_prepared = true;
                         }
                         if ui.small_button("Build Evidence").clicked() {
                             self.export_preview = self.build_markdown_export();
@@ -1466,7 +1476,7 @@ impl VtLensApp {
                     ui.add_space(4.0);
                     ui.label(RichText::new("Evidencia Markdown:").weak().size(9.0));
                     ui.add(TextEdit::multiline(&mut self.export_preview).desired_rows(6).desired_width(f32::INFINITY));
-                });
+                    });
             });
     }
 }
@@ -1582,6 +1592,7 @@ impl eframe::App for VtLensApp {
             || self.only_network_active != prev_only_active
         {
             self.update_caches();
+            self.analysis_prepared = false;
         }
     }
 }
@@ -1779,4 +1790,3 @@ pub fn capture_system_snapshot() -> ProcSnapshot {
         status,
     }
 }
-

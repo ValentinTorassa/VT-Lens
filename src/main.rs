@@ -1,6 +1,7 @@
 mod app;
 mod capture;
 mod model;
+mod redaction;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {

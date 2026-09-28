@@ -99,9 +99,9 @@ cargo install --path .
 - Live network table: protocol, owner process, local address, remote address,
   connection state, queue sizes, socket inode.
 - Process focus: click a process to filter its network activity.
-- LLM analysis workspace: build a prompt from the selected process/network
-  slice.
-- Markdown evidence export for labs, writeups, and videos.
+- LLM analysis workspace: preview a redacted prompt from the selected
+  process/network slice before sending it to a provider.
+- Redacted Markdown evidence preview for labs, writeups, and videos.
 
 ---
 
@@ -128,13 +128,15 @@ with `rustfmt`.
 - Do not publish exports that contain real private hosts, internal services,
   tokens, customer data, employer data, or personal network details.
 - The MVP does not capture packet payloads.
-- Future LLM integration must redact API keys and must never log provider keys.
+- Prompt and Markdown previews redact command lines, common credential patterns,
+  email addresses, home paths and IP addresses. Review the preview before sending
+  or sharing: pattern matching cannot recognize every kind of private data.
+- Provider keys are used for the request and are not written to logs.
 
 ## Roadmap
 
-1. Wire OpenRouter/OpenAI/Anthropic streaming into the analysis panel.
-2. Store provider keys locally via the OS keyring.
-3. Add redaction before export and before LLM submission.
+1. Store provider keys locally via the OS keyring.
+2. Improve redaction with structured fields and user-defined private terms.
 4. Add optional packet capture mode behind an explicit root/capability warning.
 5. Add DNS/SNI/cert-chain enrichment for the network pane.
 
