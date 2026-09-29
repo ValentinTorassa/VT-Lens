@@ -64,6 +64,10 @@ Una vez completado, podrás buscar **"VT Lens"** en tu lanzador de aplicaciones 
 vt-lens
 ```
 
+Para una captura pública sin exponer procesos, sockets o nombres del equipo,
+ejecutá `vt-lens --demo`. La ventana muestra datos sintéticos y una etiqueta
+visible de demo; el botón de refrescar conserva ese modo durante toda la sesión.
+
 ---
 
 ### 4. Instalación vía NPM (Global)

@@ -97,6 +97,7 @@ pub struct VtLensApp {
     export_preview: String,
     private_terms: String,
     status: String,
+    demo_mode: bool,
     auto_refresh: bool,
     tx_snapshot: std::sync::mpsc::Sender<ProcSnapshot>,
     rx_snapshot: std::sync::mpsc::Receiver<ProcSnapshot>,
@@ -164,9 +165,10 @@ impl VtLensApp {
         // Spawn background polling thread loop
         let tx_snapshot_clone = tx_snapshot.clone();
         let ctx_clone = cc.egui_ctx.clone();
+        let demo_mode = std::env::args().any(|arg| arg == "--demo");
         std::thread::spawn(move || {
             loop {
-                let snapshot = capture_system_snapshot();
+                let snapshot = if demo_mode { demo_snapshot() } else { capture_system_snapshot() };
                 if tx_snapshot_clone.send(snapshot).is_err() {
                     break;
                 }
@@ -226,6 +228,7 @@ impl VtLensApp {
             export_preview: String::new(),
             private_terms: String::new(),
             status: "Starting capture".to_string(),
+            demo_mode,
             auto_refresh: true,
             tx_snapshot,
             rx_snapshot,
@@ -679,14 +682,15 @@ impl VtLensApp {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("VT LENS").strong().size(15.0));
-                ui.label(RichText::new("Local system visibility · no root · /proc based").weak().size(10.0));
+                ui.label(RichText::new(if self.demo_mode { "DEMO · datos sintéticos · sin captura del equipo" } else { "Local system visibility · no root · /proc based" }).weak().size(10.0));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("⟳ Refresh").clicked() {
                     let tx = self.tx_snapshot.clone();
                     let ctx = ui.ctx().clone();
+                    let demo_mode = self.demo_mode;
                     std::thread::spawn(move || {
-                        let snapshot = capture_system_snapshot();
+                        let snapshot = if demo_mode { demo_snapshot() } else { capture_system_snapshot() };
                         let _ = tx.send(snapshot);
                         ctx.request_repaint();
                     });
@@ -965,8 +969,9 @@ impl VtLensApp {
                 if ui.button("⟳ Refrescar ahora").clicked() {
                     let tx = self.tx_snapshot.clone();
                     let ctx = ui.ctx().clone();
+                    let demo_mode = self.demo_mode;
                     std::thread::spawn(move || {
-                        let snapshot = capture_system_snapshot();
+                        let snapshot = if demo_mode { demo_snapshot() } else { capture_system_snapshot() };
                         let _ = tx.send(snapshot);
                         ctx.request_repaint();
                     });
@@ -1483,6 +1488,30 @@ impl VtLensApp {
                     });
             });
     }
+}
+
+/// Public screenshots use this explicit synthetic dataset; no host telemetry is captured.
+pub fn demo_snapshot() -> ProcSnapshot {
+    let processes = [
+        (1420, "browser", "browser --profile demo", 420_000, 12, 2),
+        (1842, "web-server", "web-server --listen 127.0.0.1:8080", 86_000, 6, 1),
+        (2301, "ssh-agent", "ssh-agent", 4_600, 1, 0),
+        (2714, "database", "database --config demo", 152_000, 8, 1),
+        (3380, "vt-lens", "vt-lens --demo", 74_000, 5, 0),
+    ].into_iter().map(|(pid, name, cmdline, rss_kb, threads, socket_count)| ProcessRow {
+        pid, name: name.into(), cmdline: cmdline.into(), state: "S".into(),
+        rss_kb, threads, socket_count,
+    }).collect();
+    let connections = [
+        ("tcp", "127.0.0.1:8080", "0.0.0.0:0", "LISTEN", 1842, "web-server"),
+        ("tcp", "192.0.2.10:53918", "198.51.100.42:443", "ESTABLISHED", 1420, "browser"),
+        ("tcp", "127.0.0.1:5432", "0.0.0.0:0", "LISTEN", 2714, "database"),
+    ].into_iter().enumerate().map(|(index, (protocol, local_addr, remote_addr, state, pid, process))| NetRow {
+        protocol: protocol.into(), local_addr: local_addr.into(), remote_addr: remote_addr.into(),
+        state: state.into(), tx_queue: 0, rx_queue: 0, inode: format!("demo-{index}"),
+        owner: Some(crate::model::SocketOwner { pid, process: process.into() }),
+    }).collect();
+    ProcSnapshot { processes, connections, status: "DEMO · datos sintéticos · sin captura del equipo".into() }
 }
 
 impl eframe::App for VtLensApp {
