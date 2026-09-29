@@ -1,5 +1,6 @@
 mod app;
 mod capture;
+mod keyring;
 mod model;
 mod redaction;
 

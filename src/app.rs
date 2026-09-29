@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, RichText, TextEdit};
 
 use crate::capture::{read_connections, read_processes, socket_owners};
+use crate::keyring::{self, Action as KeyringAction, Outcome as KeyringOutcome};
 use crate::model::{NetRow, ProcessRow};
 use crate::redaction::redact_with_terms;
 
@@ -44,6 +45,15 @@ impl LlmProvider {
             Self::OpenAI => "https://api.openai.com/v1/chat/completions",
             Self::Anthropic => "https://api.anthropic.com/v1/messages",
             Self::Ollama => "http://localhost:11434/api/chat",
+        }
+    }
+
+    fn keyring_name(&self) -> &'static str {
+        match self {
+            Self::OpenRouter => "openrouter",
+            Self::OpenAI => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Ollama => "ollama",
         }
     }
 }
@@ -103,6 +113,9 @@ pub struct VtLensApp {
     rx_snapshot: std::sync::mpsc::Receiver<ProcSnapshot>,
     // LLM Analysis Integration
     api_key: String,
+    keyring_status: String,
+    tx_keyring: std::sync::mpsc::Sender<(&'static str, Result<KeyringOutcome, String>)>,
+    rx_keyring: std::sync::mpsc::Receiver<(&'static str, Result<KeyringOutcome, String>)>,
     provider: LlmProvider,
     model_name: String,
     analysis_result: String,
@@ -160,6 +173,7 @@ impl VtLensApp {
         cc.egui_ctx.set_visuals(visuals);
 
         let (tx_analysis, rx_analysis) = std::sync::mpsc::channel();
+        let (tx_keyring, rx_keyring) = std::sync::mpsc::channel();
         let (tx_snapshot, rx_snapshot) = std::sync::mpsc::channel();
 
         // Spawn background polling thread loop
@@ -233,6 +247,9 @@ impl VtLensApp {
             tx_snapshot,
             rx_snapshot,
             api_key: String::new(),
+            keyring_status: String::new(),
+            tx_keyring,
+            rx_keyring,
             provider: LlmProvider::OpenRouter,
             model_name: LlmProvider::OpenRouter.default_model().to_string(),
             analysis_result: String::new(),
@@ -256,7 +273,21 @@ impl VtLensApp {
         };
 
         app.update_caches();
+        if !app.demo_mode {
+            app.run_keyring_action(KeyringAction::Load, &cc.egui_ctx);
+        }
         app
+    }
+
+    fn run_keyring_action(&self, action: KeyringAction, ctx: &egui::Context) {
+        let provider = self.provider.keyring_name();
+        let tx = self.tx_keyring.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = keyring::perform(provider, action);
+            let _ = tx.send((provider, result));
+            ctx.request_repaint();
+        });
     }
 
     fn classify_endpoint(addr: &str) -> EndpointClass {
@@ -824,7 +855,7 @@ impl VtLensApp {
                                         self.provider,
                                         self.model_name.clone(),
                                         self.api_key.clone(),
-                                        self.build_prompt(),
+                                        redact_with_terms(&self.build_prompt(), &self.private_terms),
                                         self.tx_analysis.clone(),
                                         ui.ctx().clone(),
                                     );
@@ -859,7 +890,7 @@ impl VtLensApp {
                                         self.provider,
                                         self.model_name.clone(),
                                         self.api_key.clone(),
-                                        self.build_prompt(),
+                                        redact_with_terms(&self.build_prompt(), &self.private_terms),
                                         self.tx_analysis.clone(),
                                         ui.ctx().clone(),
                                     );
@@ -1389,6 +1420,11 @@ impl VtLensApp {
                         });
                     if self.provider != prev_provider {
                         self.model_name = self.provider.default_model().to_string();
+                        self.api_key.clear();
+                        self.keyring_status.clear();
+                        if !self.demo_mode && self.provider != LlmProvider::Ollama {
+                            self.run_keyring_action(KeyringAction::Load, ui.ctx());
+                        }
                     }
 
                     ui.add(TextEdit::singleline(&mut self.model_name).hint_text("Modelo").desired_width(100.0));
@@ -1397,6 +1433,20 @@ impl VtLensApp {
                 if self.provider != LlmProvider::Ollama {
                     ui.add_space(4.0);
                     ui.add(TextEdit::singleline(&mut self.api_key).password(true).hint_text("API Key").desired_width(f32::INFINITY));
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!self.api_key.trim().is_empty(), egui::Button::new("Guardar en llavero")).clicked() {
+                            self.run_keyring_action(KeyringAction::Save(self.api_key.clone()), ui.ctx());
+                        }
+                        if ui.button("Cargar").clicked() {
+                            self.run_keyring_action(KeyringAction::Load, ui.ctx());
+                        }
+                        if ui.button("Borrar del llavero").clicked() {
+                            self.run_keyring_action(KeyringAction::Clear, ui.ctx());
+                        }
+                    });
+                    if !self.keyring_status.is_empty() {
+                        ui.label(RichText::new(&self.keyring_status).small().weak());
+                    }
                 }
 
                 ui.add_space(6.0);
@@ -1554,6 +1604,26 @@ impl eframe::App for VtLensApp {
                 }
             }
             ctx.request_repaint();
+        }
+
+        while let Ok((provider, result)) = self.rx_keyring.try_recv() {
+            if provider != self.provider.keyring_name() {
+                continue;
+            }
+            match result {
+                Ok(KeyringOutcome::Loaded(key)) => {
+                    if self.api_key.is_empty() {
+                        self.api_key = key;
+                    }
+                    self.keyring_status = "Clave cargada del llavero".to_string();
+                }
+                Ok(KeyringOutcome::Saved) => self.keyring_status = "Clave guardada en el llavero".to_string(),
+                Ok(KeyringOutcome::Cleared) => {
+                    self.api_key.clear();
+                    self.keyring_status = "Clave borrada del llavero".to_string();
+                }
+                Err(message) => self.keyring_status = message,
+            }
         }
 
         ctx.request_repaint_after(Duration::from_millis(500));

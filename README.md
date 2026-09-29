@@ -137,12 +137,16 @@ with `rustfmt`.
   also accepts comma-separated private terms for this session; they are applied
   again immediately before a provider request. Review the preview before
   sending or sharing: pattern matching cannot recognize every kind of private data.
-- Provider keys are used for the request and are not written to logs.
+- Provider keys are used for the request and are not written to logs. On Linux,
+  `secret-tool` stores them in the desktop OS keyring when you click **Guardar en
+  llavero**. VT Lens loads the selected provider's key at startup and when you
+  switch providers. **Borrar del llavero** removes it. A locked or unavailable
+  keyring leaves the field empty; you can still paste a key for this session.
+  Demo mode never reads the keyring.
 
 ## Roadmap
 
-1. Store provider keys locally via the OS keyring.
-2. Persist private-term preferences locally without copying them to exports.
+1. Persist private-term preferences locally without copying them to exports.
 4. Add optional packet capture mode behind an explicit root/capability warning.
 5. Add DNS/SNI/cert-chain enrichment for the network pane.
 
