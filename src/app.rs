@@ -35,7 +35,7 @@ impl LlmProvider {
         match self {
             Self::OpenRouter => "google/gemini-2.5-flash",
             Self::OpenAI => "gpt-4o-mini",
-            Self::Anthropic => "claude-3-5-sonnet-20240620",
+            Self::Anthropic => "claude-opus-5-5",
             Self::Ollama => "llama3",
         }
     }
@@ -1563,9 +1563,12 @@ fn perform_llm_stream_request(
             if api_key.trim().is_empty() {
                 return Err("API Key is required for Anthropic".to_string());
             }
+            // Server-side fallback: if the model declines on a safety category,
+            // the API reroutes the request instead of returning an empty answer.
             request = request
                 .set("x-api-key", api_key.trim())
                 .set("anthropic-version", "2023-06-01")
+                .set("anthropic-beta", "server-side-fallback-2026-07-01")
                 .set("Content-Type", "application/json");
         }
         LlmProvider::Ollama => {
@@ -1587,9 +1590,12 @@ fn perform_llm_stream_request(
             })
         }
         LlmProvider::Anthropic => {
+            // Current models think adaptively and that counts toward
+            // max_tokens, so leave room; the response is streamed anyway.
             serde_json::json!({
                 "model": model_name,
-                "max_tokens": 2048,
+                "max_tokens": 64000,
+                "fallbacks": "default",
                 "messages": [
                     {
                         "role": "user",
@@ -1613,15 +1619,17 @@ fn perform_llm_stream_request(
         }
     };
 
-    let response = request
-        .send_json(body)
-        .map_err(|err| format!("HTTP request failed: {err}"))?;
-
-    let status = response.status();
-    if status < 200 || status >= 300 {
-        let err_body = response.into_string().unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(format!("Server returned status {status}: {err_body}"));
-    }
+    // ureq 2 turns every 4xx/5xx into Error::Status, so the provider's error
+    // body has to be read from there (a status check on Ok never fired).
+    let response = match request.send_json(body) {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, response)) => {
+            let body = response.into_string().unwrap_or_default();
+            let snippet: String = body.chars().take(400).collect();
+            return Err(format!("El proveedor respondió HTTP {code}: {snippet}"));
+        }
+        Err(err) => return Err(format!("HTTP request failed: {err}")),
+    };
 
     let reader = std::io::BufReader::new(response.into_reader());
 
@@ -1646,7 +1654,16 @@ fn perform_llm_stream_request(
                         json_chunk["choices"][0]["delta"]["content"].as_str().map(|s| s.to_string())
                     }
                     LlmProvider::Anthropic => {
-                        json_chunk["delta"]["text"].as_str().map(|s| s.to_string())
+                        if json_chunk["type"] == "error" {
+                            let message = json_chunk["error"]["message"].as_str().unwrap_or("error del proveedor");
+                            return Err(format!("El proveedor cortó la respuesta: {message}"));
+                        }
+                        if json_chunk["delta"]["stop_reason"] == "refusal" {
+                            Some("\n\n[El modelo declinó responder esta solicitud.]".to_string())
+                        } else {
+                            // Only text deltas; thinking deltas are not shown.
+                            json_chunk["delta"]["text"].as_str().map(|s| s.to_string())
+                        }
                     }
                     LlmProvider::Ollama => {
                         json_chunk["message"]["content"].as_str().map(|s| s.to_string())
