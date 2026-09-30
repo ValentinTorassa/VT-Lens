@@ -191,16 +191,15 @@ impl VtLensApp {
         std::thread::spawn(move || {
             while let Ok(request) = rx_dns.recv() {
                 let ip_str = request.ip.clone();
-                let (clean_ip, port_suffix) = if let Some(pos) = ip_str.find(':') {
-                    (&ip_str[..pos], &ip_str[pos..])
-                } else {
-                    (&ip_str[..], "")
-                };
+                // "1.2.3.4:443" and "[2001:db8::1]:443" both parse as a socket
+                // address; splitting on the first ':' broke every IPv6 peer.
+                let parsed = ip_str.parse::<std::net::SocketAddr>().ok();
 
-                if let Ok(ip_addr) = clean_ip.parse::<std::net::IpAddr>() {
+                if let Some(socket_addr) = parsed {
+                    let ip_addr = socket_addr.ip();
                     match dns_lookup::lookup_addr(&ip_addr) {
                         Ok(hostname) => {
-                            let display_name = format!("{}{}", hostname, port_suffix);
+                            let display_name = format!("{}:{}", hostname, socket_addr.port());
                             if let Ok(mut cache) = dns_cache_clone.lock() {
                                 cache.insert(ip_str.clone(), display_name);
                             }
@@ -516,6 +515,15 @@ impl VtLensApp {
         self.build_ai_prompt()
     }
 
+    /// Every path to the LLM goes through the preview: the banner buttons only
+    /// fill it, and "2. Enviar a IA" sends what the user saw (re-redacted).
+    fn prepare_analysis_preview(&mut self) {
+        self.explain_prompt = self.build_prompt();
+        self.export_preview = self.build_markdown_export();
+        self.analysis_prepared = true;
+        self.analysis_result = "Vista previa lista en el inspector: revisala y usá \"2. Enviar a IA\".".to_string();
+    }
+
     fn build_markdown_export(&self) -> String {
         redact_with_terms(&evidence::build_markdown(&self.evidence_input(), &self.status), &self.private_terms)
     }
@@ -660,16 +668,7 @@ impl VtLensApp {
                                     self.clear_all_filters();
                                 }
                                 if ui.button("✨ Analizar").clicked() {
-                                    self.analysis_loading = true;
-                                    self.analysis_result = "Iniciando análisis...".to_string();
-                                    run_llm_analysis(
-                                        self.provider,
-                                        self.model_name.clone(),
-                                        self.api_key.clone(),
-                                        redact_with_terms(&self.build_prompt(), &self.private_terms),
-                                        self.tx_analysis.clone(),
-                                        ui.ctx().clone(),
-                                    );
+                                    self.prepare_analysis_preview();
                                 }
                             });
                         }
@@ -695,16 +694,7 @@ impl VtLensApp {
                                     self.clear_all_filters();
                                 }
                                 if ui.button("✨ Analizar con IA").clicked() {
-                                    self.analysis_loading = true;
-                                    self.analysis_result = "Iniciando análisis...".to_string();
-                                    run_llm_analysis(
-                                        self.provider,
-                                        self.model_name.clone(),
-                                        self.api_key.clone(),
-                                        redact_with_terms(&self.build_prompt(), &self.private_terms),
-                                        self.tx_analysis.clone(),
-                                        ui.ctx().clone(),
-                                    );
+                                    self.prepare_analysis_preview();
                                 }
                             }
                         });
@@ -953,7 +943,8 @@ impl VtLensApp {
                             let remote_class = Self::classify_endpoint(&connection.remote_addr);
                             let resolved_addr = if let Ok(cache) = self.dns_cache.lock() {
                                 cache.get(&connection.remote_addr).cloned().unwrap_or_else(|| {
-                                    if remote_class == EndpointClass::External || remote_class == EndpointClass::PrivateLan {
+                                    // Demo mode shows synthetic documentation IPs; never look them up.
+                                    if !self.demo_mode && (remote_class == EndpointClass::External || remote_class == EndpointClass::PrivateLan) {
                                         if let Ok(mut resolving) = self.dns_resolving.lock() {
                                             if resolving.insert(connection.remote_addr.clone()) {
                                                 let _ = self.tx_dns.send(DnsRequest {
@@ -1244,17 +1235,22 @@ impl VtLensApp {
                 if self.provider != LlmProvider::Ollama {
                     ui.add_space(4.0);
                     ui.add(TextEdit::singleline(&mut self.api_key).password(true).hint_text("API Key").desired_width(f32::INFINITY));
+                    // Demo mode never touches the system keyring (safe screenshots).
+                    let keyring_enabled = !self.demo_mode;
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(!self.api_key.trim().is_empty(), egui::Button::new("Guardar en llavero")).clicked() {
+                        if ui.add_enabled(keyring_enabled && !self.api_key.trim().is_empty(), egui::Button::new("Guardar en llavero")).clicked() {
                             self.run_keyring_action(KeyringAction::Save(self.api_key.clone()), ui.ctx());
                         }
-                        if ui.button("Cargar").clicked() {
+                        if ui.add_enabled(keyring_enabled, egui::Button::new("Cargar")).clicked() {
                             self.run_keyring_action(KeyringAction::Load, ui.ctx());
                         }
-                        if ui.button("Borrar del llavero").clicked() {
+                        if ui.add_enabled(keyring_enabled, egui::Button::new("Borrar del llavero")).clicked() {
                             self.run_keyring_action(KeyringAction::Clear, ui.ctx());
                         }
                     });
+                    if self.demo_mode {
+                        ui.label(RichText::new("Modo demo: el llavero del sistema está desactivado.").small().weak());
+                    }
                     if !self.keyring_status.is_empty() {
                         ui.label(RichText::new(&self.keyring_status).small().weak());
                     }
@@ -1268,9 +1264,7 @@ impl VtLensApp {
                         ui.label("Analizando...");
                     } else {
                         if ui.button("1. Preparar vista previa").clicked() {
-                            self.explain_prompt = self.build_prompt();
-                            self.export_preview = self.build_markdown_export();
-                            self.analysis_prepared = true;
+                            self.prepare_analysis_preview();
                         }
                         if self.analysis_prepared && ui.button("2. Enviar a IA").clicked() {
                             self.analysis_loading = true;
