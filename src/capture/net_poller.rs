@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+use super::strip_control;
 use crate::model::{NetRow, SocketOwner};
 
 pub fn socket_owners() -> HashMap<String, SocketOwner> {
@@ -24,7 +25,7 @@ pub fn socket_owners() -> HashMap<String, SocketOwner> {
         };
 
         let process = fs::read_to_string(entry.path().join("comm"))
-            .map(|value| value.trim().to_string())
+            .map(|value| strip_control(value.trim()).trim().to_string())
             .unwrap_or_else(|_| pid_text.to_string());
 
         let fd_dir = entry.path().join("fd");
@@ -126,7 +127,7 @@ fn parse_addr_port(value: &str, ipv6: bool) -> Option<String> {
     let port = u16::from_str_radix(port, 16).ok()?;
 
     if ipv6 {
-        Some(format!("[{}]:{}", format_ipv6_raw(addr), port))
+        Some(format!("[{}]:{}", parse_ipv6(addr)?, port))
     } else {
         Some(format!("{}:{}", parse_ipv4(addr)?, port))
     }
@@ -148,16 +149,19 @@ fn parse_ipv4(value: &str) -> Option<String> {
     ))
 }
 
-fn format_ipv6_raw(value: &str) -> String {
+/// /proc/net/tcp6 prints the address as four 32-bit words, each in host byte
+/// order (little-endian on x86 and arm64), so every word's bytes are reversed.
+fn parse_ipv6(value: &str) -> Option<std::net::Ipv6Addr> {
     if value.len() != 32 {
-        return value.to_string();
+        return None;
     }
-
-    (0..value.len())
-        .step_by(4)
-        .map(|offset| &value[offset..offset + 4])
-        .collect::<Vec<_>>()
-        .join(":")
+    let mut bytes = [0u8; 16];
+    for word in 0..4 {
+        let raw = u32::from_str_radix(&value[word * 8..word * 8 + 8], 16).ok()?;
+        let ordered = if cfg!(target_endian = "little") { raw.swap_bytes() } else { raw };
+        bytes[word * 4..word * 4 + 4].copy_from_slice(&ordered.to_be_bytes());
+    }
+    Some(std::net::Ipv6Addr::from(bytes))
 }
 
 fn state_label(value: &str) -> &'static str {
@@ -185,6 +189,17 @@ mod tests {
     fn parses_ipv4_little_endian_proc_addr() {
         assert_eq!(parse_ipv4("0100007F").as_deref(), Some("127.0.0.1"));
         assert_eq!(parse_addr_port("0100007F:1F90", false).as_deref(), Some("127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn parses_ipv6_in_kernel_word_order() {
+        assert_eq!(parse_addr_port("00000000000000000000000001000000:0277", true).as_deref(), Some("[::1]:631"));
+        assert_eq!(parse_addr_port("00000000000000000000000000000000:0016", true).as_deref(), Some("[::]:22"));
+        // 2001:db8::1 as the kernel prints it
+        assert_eq!(parse_addr_port("B80D0120000000000000000001000000:01BB", true).as_deref(), Some("[2001:db8::1]:443"));
+        // IPv4-mapped 127.0.0.1
+        assert_eq!(parse_addr_port("0000000000000000FFFF00000100007F:1F90", true).as_deref(), Some("[::ffff:127.0.0.1]:8080"));
+        assert_eq!(parse_addr_port("zz:0016", true), None);
     }
 
     #[test]

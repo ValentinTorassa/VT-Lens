@@ -1550,7 +1550,7 @@ pub fn demo_snapshot() -> ProcSnapshot {
         (3380, "vt-lens", "vt-lens --demo", 74_000, 5, 0),
     ].into_iter().map(|(pid, name, cmdline, rss_kb, threads, socket_count)| ProcessRow {
         pid, name: name.into(), cmdline: cmdline.into(), state: "S".into(),
-        rss_kb, threads, socket_count,
+        rss_kb, threads, socket_count, uid: Some(1000),
     }).collect();
     let connections = [
         ("tcp", "127.0.0.1:8080", "0.0.0.0:0", "LISTEN", 1842, "web-server"),

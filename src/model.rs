@@ -7,6 +7,8 @@ pub struct ProcessRow {
     pub rss_kb: u64,
     pub threads: u32,
     pub socket_count: usize,
+    /// Real UID from /proc/<pid>/status; only its class leaves the app.
+    pub uid: Option<u32>,
 }
 
 impl ProcessRow {
