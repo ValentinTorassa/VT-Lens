@@ -79,12 +79,13 @@ NPM compilará automáticamente el binario nativo en modo release y lo registrar
 
 ---
 
-### 5. Instalación vía APT (Debian/Ubuntu)
-Si deseas utilizar un paquete Debian (`.deb`), puedes descargar el archivo `.deb` compilado desde la pestaña de Releases en GitHub e instalarlo usando:
+### 5. Paquete Debian (`.deb`), opcional
+Las releases publican solo el tarball Linux x86_64 y `SHA256SUMS`; no hay `.deb` precompilado. Si querés un paquete, generalo vos con [`cargo-deb`](https://github.com/kornelski/cargo-deb):
 ```bash
-sudo apt install ./vt-lens_*.deb
+cargo install cargo-deb
+cargo deb
+sudo apt install ./target/debian/vt-lens_*.deb
 ```
-*(También puedes empaquetarlo tú mismo instalando `cargo-deb` y ejecutando `cargo deb` en la raíz del proyecto).*
 
 ---
 
@@ -103,9 +104,11 @@ cargo install --path .
 - Live network table: protocol, owner process, local address, remote address,
   connection state, queue sizes, socket inode.
 - Process focus: click a process to filter its network activity.
-- LLM analysis workspace: preview a redacted prompt from the selected
-  process/network slice before sending it to a provider.
-- Redacted Markdown evidence preview for labs, writeups, and videos.
+- LLM analysis workspace: every analysis goes through a preview of the
+  prompt built from the selected process/network slice; nothing is sent until
+  you press **2. Enviar a IA**.
+- Markdown evidence preview for labs, writeups, and videos, built from the
+  same allowlist as the prompt.
 
 ---
 
@@ -132,23 +135,38 @@ with `rustfmt`.
 - Do not publish exports that contain real private hosts, internal services,
   tokens, customer data, employer data, or personal network details.
 - The MVP does not capture packet payloads.
-- Prompt and Markdown previews redact command lines, structured identity and
-  credential fields, email addresses, home paths and IP addresses. The preview
-  also accepts comma-separated private terms for this session; they are applied
-  again immediately before a provider request. Review the preview before
-  sending or sharing: pattern matching cannot recognize every kind of private data.
+- The prompt evidence and the Markdown export are built from an allowlist of
+  structured fields (`src/evidence.rs`): process basename, PID, memory and
+  thread counts, UID class (root / sistema / usuario), protocol, socket state,
+  inode, and each endpoint reduced to its class and port (`externa/v4:443`,
+  `loopback/v6:631`). Command lines, IP addresses, hostnames and account names
+  are never included, so they cannot leak through a pattern that failed to match.
+- Control characters in `comm` and argv are replaced at capture time.
+- Everything that leaves the app (including text you type into the editable
+  preview) then goes through free-text redaction: credential names with `:` or
+  `=` (`OPENAI_API_KEY=`, `GITHUB_TOKEN:`), secret flags (`--password X`),
+  `user:pass@` in URLs, common key formats (`sk-`, `ghp_`, `github_pat_`,
+  `AKIA`, `xox*-`, `AIza`, `glpat-`), long high-entropy tokens, email
+  addresses, home paths and IPv4/IPv6 literals. The preview also accepts
+  comma-separated private terms for this session; they are applied again
+  immediately before a provider request. Review the preview before sending or
+  sharing: pattern matching cannot recognize every kind of private data.
+- Reverse DNS lookups (display only, never exported) tell your resolver which
+  peers are on screen; demo mode does not perform them.
 - Provider keys are used for the request and are not written to logs. On Linux,
   `secret-tool` stores them in the desktop OS keyring when you click **Guardar en
   llavero**. VT Lens loads the selected provider's key at startup and when you
   switch providers. **Borrar del llavero** removes it. A locked or unavailable
   keyring leaves the field empty; you can still paste a key for this session.
-  Demo mode never reads the keyring.
+  Demo mode never reads or writes the keyring (its buttons are disabled).
+- The Anthropic provider defaults to `claude-opus-5-5` with the server-side
+  fallback beta enabled; the model field stays editable.
 
 ## Roadmap
 
 1. Persist private-term preferences locally without copying them to exports.
-4. Add optional packet capture mode behind an explicit root/capability warning.
-5. Add DNS/SNI/cert-chain enrichment for the network pane.
+2. Add optional packet capture mode behind an explicit root/capability warning.
+3. Add DNS/SNI/cert-chain enrichment for the network pane.
 
 ## License
 

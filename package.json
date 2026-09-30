@@ -1,6 +1,6 @@
 {
   "name": "vt-lens",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local system visibility - /proc based native tool",
   "bin": {
     "vt-lens": "bin/vt-lens"
