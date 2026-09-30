@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, RichText, TextEdit};
 
 use crate::capture::{read_connections, read_processes, socket_owners};
+use crate::evidence::{self, EndpointClass, EvidenceInput};
 use crate::keyring::{self, Action as KeyringAction, Outcome as KeyringOutcome};
 use crate::model::{NetRow, ProcessRow};
 use crate::redaction::redact_with_terms;
@@ -66,17 +67,6 @@ pub enum NetFilterType {
     Listening,
     Tcp,
     Udp,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EndpointClass {
-    Localhost,
-    PrivateLan,
-    Listening,
-    Multicast,
-    External,
-    Unknown,
 }
 
 pub struct ProcSnapshot {
@@ -291,28 +281,7 @@ impl VtLensApp {
     }
 
     fn classify_endpoint(addr: &str) -> EndpointClass {
-        let clean = addr.trim().to_lowercase();
-        if clean.is_empty() || clean == "0.0.0.0:*" || clean == "[::]:*" || clean.starts_with("0.0.0.0") || clean.starts_with("[::]") || clean.ends_with(":0") {
-            EndpointClass::Listening
-        } else if clean.contains("127.") || clean.contains("::1") {
-            EndpointClass::Localhost
-        } else if clean.starts_with("10.") || clean.starts_with("192.168.") {
-            EndpointClass::PrivateLan
-        } else if clean.starts_with("172.") {
-            let parts: Vec<&str> = clean.split('.').collect();
-            if parts.len() >= 2 {
-                if let Ok(second) = parts[1].parse::<u8>() {
-                    if second >= 16 && second <= 31 {
-                        return EndpointClass::PrivateLan;
-                    }
-                }
-            }
-            EndpointClass::External
-        } else if clean.starts_with("224.") || clean.starts_with("225.") || clean.starts_with("226.") || clean.starts_with("227.") || clean.starts_with("228.") || clean.starts_with("229.") || clean.starts_with("239.") || clean.starts_with("ff") {
-            EndpointClass::Multicast
-        } else {
-            EndpointClass::External
-        }
+        evidence::classify(addr)
     }
 
     #[allow(dead_code)]
@@ -495,116 +464,19 @@ impl VtLensApp {
             .and_then(|pid| self.processes.iter().find(|process| process.pid == pid))
     }
 
-    fn build_ai_evidence(&self) -> String {
-        let mut evidence = String::new();
-
-        if let Some(pid) = self.selected_pid {
-            if let Some(p) = self.processes.iter().find(|proc| proc.pid == pid) {
-                evidence.push_str("Selected process:\n");
-                evidence.push_str(&format!("* pid: {}\n", p.pid));
-                evidence.push_str(&format!("* name: {}\n", p.name));
-                evidence.push_str(&format!("* state: {}\n", p.state));
-                evidence.push_str(&format!("* rss_mb: {:.1}\n", p.rss_mb()));
-                evidence.push_str(&format!("* threads: {}\n", p.threads));
-                evidence.push_str(&format!("* sockets_reported: {}\n", p.socket_count));
-                evidence.push_str(&format!("* cmdline: {}\n\n", p.cmdline));
-            } else {
-                evidence.push_str(&format!("Selected process PID: {}\n\n", pid));
-            }
-
-            let pid_conns: Vec<&NetRow> = self.connections.iter().filter(|c| c.owner.as_ref().map(|o| o.pid) == Some(pid)).collect();
-            let total = pid_conns.len();
-            let ext = pid_conns.iter().filter(|c| Self::classify_endpoint(&c.remote_addr) == EndpointClass::External).count();
-            let local = pid_conns.iter().filter(|c| Self::classify_endpoint(&c.remote_addr) == EndpointClass::Localhost).count();
-            let listen = pid_conns.iter().filter(|c| c.state == "LISTEN").count();
-            let udp_multi = pid_conns.iter().filter(|c| c.protocol.starts_with("udp") || Self::classify_endpoint(&c.remote_addr) == EndpointClass::Multicast).count();
-
-            evidence.push_str("Connection summary for this PID:\n");
-            evidence.push_str(&format!("* total_current_connections: {}\n", total));
-            evidence.push_str(&format!("* external: {}\n", ext));
-            evidence.push_str(&format!("* localhost: {}\n", local));
-            evidence.push_str(&format!("* listening: {}\n", listen));
-            evidence.push_str(&format!("* udp_multicast: {}\n\n", udp_multi));
-
-            if let Some(inode) = &self.selected_network_inode {
-                if let Some(conn) = self.connections.iter().find(|c| &c.inode == inode) {
-                    evidence.push_str("Selected connection:\n");
-                    evidence.push_str(&format!("* protocol: {}\n", conn.protocol));
-                    evidence.push_str(&format!("* local: {}\n", conn.local_addr));
-                    evidence.push_str(&format!("* remote: {}\n", conn.remote_addr));
-                    evidence.push_str(&format!("* state: {}\n", conn.state));
-                    evidence.push_str(&format!("* inode: {}\n", conn.inode));
-                    evidence.push_str(&format!("* classification: {:?}\n\n", Self::classify_endpoint(&conn.remote_addr)));
-                }
-            }
-
-            evidence.push_str("Related connections:\n");
-            if pid_conns.is_empty() {
-                evidence.push_str("No current network connections were found for this PID in the latest snapshot.\n\
-                                   Possible causes:\n\
-                                   * the process closed the sockets\n\
-                                   * the snapshot changed\n\
-                                   * the process has socket-like file descriptors but no active TCP/UDP entries\n\
-                                   * active filters are hiding results\n\n");
-            } else {
-                for (idx, conn) in pid_conns.iter().take(20).enumerate() {
-                    let is_selected = self.selected_network_inode.as_ref() == Some(&conn.inode);
-                    let marker = if is_selected { " [SELECTED_CONNECTION]" } else { "" };
-                    evidence.push_str(&format!(
-                        "{}. {} {} -> {} [{}] inode={}{}\n",
-                        idx + 1,
-                        conn.protocol,
-                        conn.local_addr,
-                        conn.remote_addr,
-                        conn.state,
-                        conn.inode,
-                        marker
-                    ));
-                }
-                if pid_conns.len() > 20 {
-                    evidence.push_str(&format!("... and {} more connections.\n", pid_conns.len() - 20));
-                }
-            }
-        } else {
-            evidence.push_str("No process selected.\n\n");
-            if let Some(inode) = &self.selected_network_inode {
-                if let Some(conn) = self.connections.iter().find(|c| &c.inode == inode) {
-                    evidence.push_str("Selected connection:\n");
-                    evidence.push_str(&format!("* protocol: {}\n", conn.protocol));
-                    evidence.push_str(&format!("* local: {}\n", conn.local_addr));
-                    evidence.push_str(&format!("* remote: {}\n", conn.remote_addr));
-                    evidence.push_str(&format!("* state: {}\n", conn.state));
-                    evidence.push_str(&format!("* inode: {}\n", conn.inode));
-                    evidence.push_str(&format!("* classification: {:?}\n\n", Self::classify_endpoint(&conn.remote_addr)));
-                }
-            }
-
-            evidence.push_str("Recent Network Connections (Sample):\n");
-            if self.filtered_connections_cache.is_empty() {
-                evidence.push_str("No current network connections were found in the latest snapshot.\n\n");
-            } else {
-                for (idx, conn) in self.filtered_connections_cache.iter().take(20).enumerate() {
-                    let is_selected = self.selected_network_inode.as_ref() == Some(&conn.inode);
-                    let marker = if is_selected { " [SELECTED_CONNECTION]" } else { "" };
-                    evidence.push_str(&format!(
-                        "{}. {} {} -> {} [{}] owner={} inode={}{}\n",
-                        idx + 1,
-                        conn.protocol,
-                        conn.local_addr,
-                        conn.remote_addr,
-                        conn.state,
-                        conn.owner.as_ref().map(|owner| owner.pid.to_string()).unwrap_or_else(|| "unknown".to_string()),
-                        conn.inode,
-                        marker
-                    ));
-                }
-                if self.filtered_connections_cache.len() > 20 {
-                    evidence.push_str(&format!("... and {} more connections.\n", self.filtered_connections_cache.len() - 20));
-                }
-            }
+    fn evidence_input(&self) -> EvidenceInput<'_> {
+        EvidenceInput {
+            processes: &self.processes,
+            connections: &self.connections,
+            selected_pid: self.selected_pid,
+            selected_inode: self.selected_network_inode.as_deref(),
+            sample: &self.filtered_connections_cache,
         }
+    }
 
-        evidence
+    /// Allowlisted evidence only (see evidence.rs): no cmdline, IPs or hostnames.
+    fn build_ai_evidence(&self) -> String {
+        evidence::build_evidence(&self.evidence_input())
     }
 
     fn build_ai_prompt(&self) -> String {
@@ -645,68 +517,7 @@ impl VtLensApp {
     }
 
     fn build_markdown_export(&self) -> String {
-        let mut markdown = String::from("# VT Lens Evidence\n\n");
-        markdown.push_str(&format!("Status: {}\n\n", self.status));
-
-        let mut focused_pid = self.selected_pid;
-        let mut process = self.selected_process();
-
-        if focused_pid.is_none() {
-            if let Some(inode) = &self.selected_network_inode {
-                if let Some(connection) = self.connections.iter().find(|c| &c.inode == inode) {
-                    if let Some(owner) = &connection.owner {
-                        focused_pid = Some(owner.pid);
-                        process = self.processes.iter().find(|p| p.pid == owner.pid);
-                    }
-                }
-            }
-        }
-
-        if let Some(p) = process {
-            markdown.push_str("## Selected Process\n\n");
-            markdown.push_str(&format!("- PID: {}\n", p.pid));
-            markdown.push_str(&format!("- Name: {}\n", p.name));
-            markdown.push_str(&format!("- State: {}\n", p.state));
-            markdown.push_str(&format!("- RSS: {:.1} MB\n", p.rss_mb()));
-            markdown.push_str(&format!("- Threads: {}\n", p.threads));
-            markdown.push_str(&format!("- Sockets: {}\n", p.socket_count));
-            markdown.push_str(&format!("- Cmdline: `{}`\n\n", p.cmdline));
-        } else if let Some(pid) = focused_pid {
-            markdown.push_str("## Selected Process\n\n");
-            markdown.push_str(&format!("- PID: {}\n\n", pid));
-        }
-
-        if let Some(inode) = &self.selected_network_inode {
-            if let Some(connection) = self.connections.iter().find(|c| &c.inode == inode) {
-                markdown.push_str("## Focused Network Connection\n\n");
-                markdown.push_str(&format!("- Protocol: {}\n", connection.protocol));
-                markdown.push_str(&format!("- Local: `{}`\n", connection.local_addr));
-                markdown.push_str(&format!("- Remote: `{}`\n", connection.remote_addr));
-                markdown.push_str(&format!("- State: {}\n", connection.state));
-                markdown.push_str(&format!("- Owner PID: {}\n", connection.owner.as_ref().map(|owner| owner.pid.to_string()).unwrap_or_else(|| "unknown".to_string())));
-                markdown.push_str(&format!("- Inode: {}\n", connection.inode));
-                markdown.push_str(&format!("- Queues: tx={} rx={}\n\n", connection.tx_queue, connection.rx_queue));
-            }
-        }
-
-        markdown.push_str("## Network Sample\n\n");
-        markdown.push_str("| Proto | Local | Remote | State | Owner | Queues |\n");
-        markdown.push_str("| --- | --- | --- | --- | --- | --- |\n");
-
-        for connection in self.filtered_connections_cache.iter().take(50) {
-            markdown.push_str(&format!(
-                "| {} | `{}` | `{}` | {} | {} | tx={} rx={} |\n",
-                connection.protocol,
-                connection.local_addr,
-                connection.remote_addr,
-                connection.state,
-                connection.owner.as_ref().map(|owner| owner.pid.to_string()).unwrap_or_else(|| "unknown".to_string()),
-                connection.tx_queue,
-                connection.rx_queue
-            ));
-        }
-
-        redact_with_terms(&markdown, &self.private_terms)
+        redact_with_terms(&evidence::build_markdown(&self.evidence_input(), &self.status), &self.private_terms)
     }
 
     fn show_header(&mut self, ui: &mut egui::Ui) {
