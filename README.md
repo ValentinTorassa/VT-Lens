@@ -122,9 +122,12 @@ cargo run
 ## Verificación de Código (Verify)
 
 ```bash
-cargo test
-cargo build
+cargo test --locked
+cargo build --locked
 ```
+
+GitHub Actions (`.github/workflows/ci.yml`) corre lo mismo en Linux, con las
+dependencias gráficas de Debian/Ubuntu del punto 1.
 
 `cargo fmt` is expected, but this local Rust toolchain currently does not ship
 with `rustfmt`.
@@ -171,12 +174,3 @@ with `rustfmt`.
 ## License
 
 GPL-3.0-only.
-
-## Verificación de regresiones - 2026-09-14
-
-```bash
-cargo test --locked
-cargo build --locked
-```
-
-GitHub Actions verifica en Linux con las dependencias gráficas documentadas. Hasta cerrar el resultado de software activo en VT-Tasks, mantener el alcance del MVP: visualización local de procesos y conexiones.
