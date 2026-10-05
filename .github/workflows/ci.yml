@@ -4,7 +4,9 @@ permissions:
   contents: read
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    # Pinned like release.yml: ubuntu-latest moves to Ubuntu 26.04 on
+    # 2026-10-19 and the apt package names below may change with it.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Install GUI build dependencies
