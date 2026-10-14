@@ -1,0 +1,75 @@
+name: Security
+
+# Dependency audit plus CodeQL. The weekly run catches advisories published
+# against dependencies that did not change.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Mondays 06:00 UTC
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The runner's stable Rust builds it; --locked uses cargo-audit's own
+      # lockfile, so the tool is the same build every run.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      # Reads Cargo.lock against the RustSec advisory database. Fails on any
+      # vulnerability; unmaintained or yanked crates are printed as warnings.
+      # Allowlisted, so they warn instead of failing. Each one is dated; drop it
+      # once the fix lands (cargo audit then reports nothing for it):
+      # - RUSTSEC-2026-0257 (GHSA-2ph8-5cr8-hr33), webbrowser 0.8.15, added 2026-10-14:
+      #   argument injection through the BROWSER template when an app opens
+      #   an attacker-controlled non-HTTP URL with spaces. It comes in
+      #   through eframe 0.27 (egui-winit), which calls it only when the UI
+      #   opens a link, and vt-lens has no hyperlink or OpenUrl anywhere in
+      #   src/. The fix is webbrowser 1.2.2, which needs an eframe upgrade
+      #   past 0.27 (breaking).
+      - name: cargo audit
+        run: |
+          echo "::warning title=Allowlisted RUSTSEC-2026-0257::webbrowser 0.8.15 (GHSA-2ph8-5cr8-hr33), allowlisted 2026-10-14: via eframe 0.27; vt-lens never opens a URL; the fix needs an eframe upgrade past 0.27 (breaking)"
+          cargo audit --ignore RUSTSEC-2026-0257
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          category: /language:${{ matrix.language }}
