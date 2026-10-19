@@ -173,4 +173,5 @@ with `rustfmt`.
 
 ## License
 
-GPL-3.0-only.
+GPL-3.0-only: version 3 of the GNU GPL, without the "or any later version" option. Full text in
+[LICENSE](LICENSE).
