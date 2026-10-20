@@ -12,7 +12,14 @@ serde_json = "1.0"
 ureq = { version = "2.9", features = ["json"] }
 dns-lookup = "4.0"
 regex = "1"
+# Only for the `screenshots` feature (README images); see src/app/screenshots.rs.
+egui_kittest = { version = "0.36.2", optional = true, features = ["eframe", "wgpu"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+
+[features]
+# cargo test --features screenshots screenshots  -> docs/screenshots/*.png
+screenshots = ["dep:egui_kittest", "dep:image"]

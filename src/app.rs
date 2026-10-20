@@ -10,6 +10,9 @@ use crate::keyring::{self, Action as KeyringAction, Outcome as KeyringOutcome};
 use crate::model::{NetRow, ProcessRow, SocketId};
 use crate::redaction::redact_with_terms;
 
+#[cfg(all(test, feature = "screenshots"))]
+mod screenshots;
+
 /// How often the polling thread captures a new snapshot.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
