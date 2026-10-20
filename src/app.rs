@@ -159,11 +159,11 @@ impl VtLensApp {
         visuals.selection.stroke.color = egui::Color32::from_rgb(255, 255, 255);
 
         // Rounded corners
-        visuals.widgets.noninteractive.rounding = egui::Rounding::same(6.0);
-        visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
-        visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
-        visuals.widgets.active.rounding = egui::Rounding::same(6.0);
-        visuals.window_rounding = egui::Rounding::same(8.0);
+        visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
+        visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+        visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+        visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
+        visuals.window_corner_radius = egui::CornerRadius::same(8);
 
         cc.egui_ctx.set_visuals(visuals);
 
@@ -638,14 +638,14 @@ impl VtLensApp {
                     })
                     .count();
 
-                let response = egui::Frame::none()
+                let response = egui::Frame::NONE
                     .fill(card_color)
                     .stroke(egui::Stroke::new(
                         1.0,
                         egui::Color32::from_rgb(229, 231, 235),
                     ))
-                    .rounding(6.0)
-                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
@@ -710,14 +710,14 @@ impl VtLensApp {
             .map(|p| (p.name.clone(), p.pid, p.socket_count));
         let width = ui.available_width();
 
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(egui::Color32::from_rgb(255, 255, 255))
             .stroke(egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgb(229, 231, 235),
             ))
-            .rounding(8.0)
-            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::symmetric(14, 10))
             .show(ui, |ui| {
                 if width < 520.0 {
                     ui.vertical(|ui| {
@@ -928,9 +928,9 @@ impl VtLensApp {
             ui.label(RichText::new("Esto puede deberse a que el proceso cerró sus conexiones, el snapshot cambió o un filtro activo las está ocultando.").weak().size(11.0));
             ui.add_space(12.0);
 
-            egui::Frame::none()
+            egui::Frame::NONE
                 .fill(egui::Color32::from_rgb(243, 244, 246))
-                .rounding(6.0)
+                .corner_radius(6.0)
                 .inner_margin(12.0)
                 .show(ui, |ui| {
                     ui.set_max_width(400.0);
@@ -984,14 +984,14 @@ impl VtLensApp {
         if available_w < 520.0 {
             ui.horizontal_wrapped(|ui| {
                 for (label, val) in metrics.iter() {
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(255, 255, 255))
                         .stroke(egui::Stroke::new(
                             1.0,
                             egui::Color32::from_rgb(229, 231, 235),
                         ))
-                        .rounding(6.0)
-                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::symmetric(10, 6))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(format!("{}:", label)).weak().size(9.0));
@@ -1008,13 +1008,13 @@ impl VtLensApp {
         } else {
             ui.columns(5, |columns| {
                 for (i, (label, val)) in metrics.iter().enumerate() {
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(255, 255, 255))
                         .stroke(egui::Stroke::new(
                             1.0,
                             egui::Color32::from_rgb(229, 231, 235),
                         ))
-                        .rounding(6.0)
+                        .corner_radius(6.0)
                         .inner_margin(8.0)
                         .show(&mut columns[i], |ui| {
                             ui.vertical_centered(|ui| {
@@ -1115,10 +1115,10 @@ impl VtLensApp {
                                             egui::Color32::from_rgb(55, 65, 81),
                                         )
                                     };
-                                    let resp = egui::Frame::none()
+                                    let resp = egui::Frame::NONE
                                         .fill(bg)
-                                        .rounding(3.0)
-                                        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                                        .corner_radius(3.0)
+                                        .inner_margin(egui::Margin::symmetric(6, 2))
                                         .show(ui, |ui| {
                                             ui.label(
                                                 RichText::new(connection.protocol.to_uppercase())
@@ -1223,10 +1223,10 @@ impl VtLensApp {
                                             egui::Color32::from_rgb(75, 85, 99),
                                         ),
                                     };
-                                    let resp = egui::Frame::none()
+                                    let resp = egui::Frame::NONE
                                         .fill(bg)
-                                        .rounding(3.0)
-                                        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                                        .corner_radius(3.0)
+                                        .inner_margin(egui::Margin::symmetric(6, 2))
                                         .show(ui, |ui| {
                                             ui.label(
                                                 RichText::new(&connection.state)
@@ -1266,9 +1266,9 @@ impl VtLensApp {
                 .on_hover_text("Copiar al portapapeles")
                 .clicked()
             {
-                ui.output_mut(|o| o.copied_text = command.to_string());
+                ui.ctx().copy_text(command.to_string());
             }
-            ui.add(egui::Label::new(RichText::new(command).monospace().size(10.0)).wrap(true));
+            ui.add(egui::Label::new(RichText::new(command).monospace().size(10.0)).wrap());
         });
     }
 
@@ -1307,14 +1307,14 @@ impl VtLensApp {
         }
 
         egui::ScrollArea::vertical()
-            .id_source("inspector_scroll_area")
+            .id_salt("inspector_scroll_area")
             .show(ui, |ui| {
                 // STATE B: Connection Selected
                 if let Some(conn) = &selected_conn {
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(255, 255, 255))
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)))
-                        .rounding(6.0)
+                        .corner_radius(6.0)
                         .inner_margin(12.0)
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
@@ -1373,10 +1373,10 @@ impl VtLensApp {
                     if let Some(pid) = focused_pid {
                         ui.label(RichText::new("VERIFICACIÓN MANUAL").strong().size(10.0).color(ui.visuals().weak_text_color()));
                         ui.add_space(2.0);
-                        egui::Frame::none()
+                        egui::Frame::NONE
                             .fill(egui::Color32::from_rgb(249, 250, 251))
                             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)))
-                            .rounding(6.0)
+                            .corner_radius(6.0)
                             .inner_margin(8.0)
                             .show(ui, |ui| {
                                 ui.vertical(|ui| {
@@ -1394,10 +1394,10 @@ impl VtLensApp {
                 }
                 // STATE A: Process Selected, No Connection Selected
                 else if let Some(p) = focused_process {
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(255, 255, 255))
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)))
-                        .rounding(6.0)
+                        .corner_radius(6.0)
                         .inner_margin(12.0)
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
@@ -1412,10 +1412,10 @@ impl VtLensApp {
                                 ui.add_space(4.0);
                                 ui.label(RichText::new("Comando:").weak().size(9.0));
                                 egui::ScrollArea::vertical()
-                                    .id_source("cmdline_scroll")
+                                    .id_salt("cmdline_scroll")
                                     .max_height(60.0)
                                     .show(ui, |ui| {
-                                        ui.add(egui::Label::new(RichText::new(&p.cmdline).monospace().size(9.0)).wrap(true));
+                                        ui.add(egui::Label::new(RichText::new(&p.cmdline).monospace().size(9.0)).wrap());
                                     });
                             });
                         });
@@ -1429,10 +1429,10 @@ impl VtLensApp {
                     let listen = pid_conns.iter().filter(|c| c.state == "LISTEN").count();
                     let udp_multi = pid_conns.iter().filter(|c| c.protocol.starts_with("udp") || Self::classify_endpoint(&c.remote_addr) == EndpointClass::Multicast).count();
 
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(255, 255, 255))
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)))
-                        .rounding(6.0)
+                        .corner_radius(6.0)
                         .inner_margin(12.0)
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
@@ -1450,10 +1450,10 @@ impl VtLensApp {
                     // Verification commands for process
                     ui.label(RichText::new("VERIFICACIÓN MANUAL").strong().size(10.0).color(ui.visuals().weak_text_color()));
                     ui.add_space(2.0);
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(249, 250, 251))
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)))
-                        .rounding(6.0)
+                        .corner_radius(6.0)
                         .inner_margin(8.0)
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
@@ -1477,7 +1477,7 @@ impl VtLensApp {
 
                 ui.horizontal(|ui| {
                     let prev_provider = self.provider;
-                    egui::ComboBox::from_id_source("inspector_provider_combo")
+                    egui::ComboBox::from_id_salt("inspector_provider_combo")
                         .selected_text(self.provider.label())
                         .show_ui(ui, |ui| {
                             for p in LlmProvider::all() {
@@ -1548,7 +1548,7 @@ impl VtLensApp {
                 if !self.analysis_result.is_empty() {
                     ui.add_space(6.0);
                     egui::ScrollArea::vertical()
-                        .id_source("inspector_analysis_scroll")
+                        .id_salt("inspector_analysis_scroll")
                         .max_height(200.0)
                         .show(ui, |ui| {
                             let mut text = self.analysis_result.clone();
@@ -1691,7 +1691,8 @@ pub fn demo_snapshot() -> ProcSnapshot {
 }
 
 impl eframe::App for VtLensApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         // 1. Capture filter/selection state before rendering
         let prev_proc_filter = self.process_filter.clone();
         let prev_net_filter = self.network_filter.clone();
@@ -1757,18 +1758,18 @@ impl eframe::App for VtLensApp {
         ctx.request_repaint_after(Duration::from_millis(500));
 
         // Header Panel
-        egui::TopBottomPanel::top("header")
+        egui::Panel::top("header")
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(egui::Color32::from_rgb(255, 255, 255))
-                    .inner_margin(egui::Margin::symmetric(16.0, 12.0)),
+                    .inner_margin(egui::Margin::symmetric(16, 12)),
             )
-            .show(ctx, |ui| self.show_header(ui));
+            .show(ui, |ui| self.show_header(ui));
 
         // Bottom Status Bar
-        egui::TopBottomPanel::bottom("status_bar")
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(249, 250, 251)).inner_margin(egui::Margin::symmetric(16.0, 8.0)))
-            .show(ctx, |ui| {
+        egui::Panel::bottom("status_bar")
+            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(249, 250, 251)).inner_margin(egui::Margin::symmetric(16, 8)))
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let total_proc = self.processes.len();
                     let total_sock = self.connections.len();
@@ -1791,30 +1792,30 @@ impl eframe::App for VtLensApp {
             });
 
         // Left Process Sidebar
-        egui::SidePanel::left("processes")
+        egui::Panel::left("processes")
             .resizable(true)
-            .default_width(280.0)
-            .min_width(180.0)
+            .default_size(280.0)
+            .min_size(180.0)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(egui::Color32::from_rgb(249, 250, 251))
                     .inner_margin(12.0),
             )
-            .show(ctx, |ui| self.show_processes(ui));
+            .show(ui, |ui| self.show_processes(ui));
 
         // Right Inspector Panel (collapsible slide-out)
         let show_inspector = self.selected_pid.is_some() || self.selected_network_inode.is_some();
         if show_inspector {
-            egui::SidePanel::right("inspector")
+            egui::Panel::right("inspector")
                 .resizable(true)
-                .default_width(320.0)
-                .min_width(180.0)
+                .default_size(320.0)
+                .min_size(180.0)
                 .frame(
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(255, 255, 255))
                         .inner_margin(12.0),
                 )
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     self.render_inspector_panel(ui);
                 });
         }
@@ -1822,11 +1823,11 @@ impl eframe::App for VtLensApp {
         // Central Panel (Network Connections Table)
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(egui::Color32::from_rgb(246, 248, 250))
                     .inner_margin(16.0),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 self.show_network(ui);
             });
 

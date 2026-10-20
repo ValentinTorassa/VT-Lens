@@ -16,6 +16,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "VT Lens",
         options,
-        Box::new(|cc| Box::new(app::VtLensApp::new(cc))),
+        Box::new(|cc| Ok(Box::new(app::VtLensApp::new(cc)))),
     )
 }
