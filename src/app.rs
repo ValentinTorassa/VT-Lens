@@ -1,13 +1,17 @@
 use std::collections::HashMap;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText, TextEdit};
 
-use crate::capture::{read_connections, read_processes, socket_owners};
+use crate::capture::{self, CaptureSource, Platform, Snapshot};
 use crate::evidence::{self, EndpointClass, EvidenceInput};
 use crate::keyring::{self, Action as KeyringAction, Outcome as KeyringOutcome};
-use crate::model::{NetRow, ProcessRow};
+use crate::model::{NetRow, ProcessRow, SocketId};
 use crate::redaction::redact_with_terms;
+
+/// How often the polling thread captures a new snapshot.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlmProvider {
@@ -74,12 +78,6 @@ pub enum NetFilterType {
     Udp,
 }
 
-pub struct ProcSnapshot {
-    pub processes: Vec<ProcessRow>,
-    pub connections: Vec<NetRow>,
-    pub status: String,
-}
-
 struct DnsRequest {
     ip: String,
     ctx: egui::Context,
@@ -95,17 +93,20 @@ pub struct VtLensApp {
     processes: Vec<ProcessRow>,
     connections: Vec<NetRow>,
     selected_pid: Option<u32>,
-    selected_network_inode: Option<String>,
+    selected_socket: Option<SocketId>,
     process_filter: String,
     network_filter: String,
     explain_prompt: String,
     export_preview: String,
     private_terms: String,
     status: String,
+    platform: Platform,
     demo_mode: bool,
     auto_refresh: bool,
-    tx_snapshot: std::sync::mpsc::Sender<ProcSnapshot>,
-    rx_snapshot: std::sync::mpsc::Receiver<ProcSnapshot>,
+    /// A manual refresh is applied even while auto refresh is paused.
+    refresh_requested: bool,
+    tx_refresh: std::sync::mpsc::Sender<()>,
+    rx_snapshot: std::sync::mpsc::Receiver<Snapshot>,
     // LLM Analysis Integration
     api_key: String,
     keyring_status: String,
@@ -136,7 +137,7 @@ pub struct VtLensApp {
 }
 
 impl VtLensApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, mut source: Box<dyn CaptureSource>) -> Self {
         let mut visuals = egui::Visuals::light();
 
         // Premium Light Mode styling (Tailwind CSS inspired palette)
@@ -165,34 +166,48 @@ impl VtLensApp {
         visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
         visuals.window_corner_radius = egui::CornerRadius::same(8);
 
-        cc.egui_ctx.set_visuals(visuals);
+        // The palette is light-only: pin the light theme so a dark OS theme
+        // (or a switch while running) does not swap in egui's dark visuals.
+        cc.egui_ctx.set_visuals_of(egui::Theme::Light, visuals);
+        cc.egui_ctx.set_theme(egui::ThemePreference::Light);
 
         let (tx_analysis, rx_analysis) = std::sync::mpsc::channel();
         let (tx_keyring, rx_keyring) = std::sync::mpsc::channel();
         let (tx_snapshot, rx_snapshot) = std::sync::mpsc::channel();
+        let (tx_refresh, rx_refresh) = std::sync::mpsc::channel::<()>();
 
-        // Spawn background polling thread loop
-        let tx_snapshot_clone = tx_snapshot.clone();
+        let platform = source.platform();
+        let demo_mode = source.is_demo();
+        // The first snapshot is taken here, so the first frame has data.
+        let first = source.capture();
+
+        // Polling thread: owns the capture backend, captures every
+        // POLL_INTERVAL or right away when the UI asks for a refresh.
         let ctx_clone = cc.egui_ctx.clone();
-        let demo_mode = std::env::args().any(|arg| arg == "--demo");
         std::thread::spawn(move || {
-            loop {
-                let snapshot = if demo_mode {
-                    demo_snapshot()
-                } else {
-                    capture_system_snapshot()
-                };
-                if tx_snapshot_clone.send(snapshot).is_err() {
+            // Stops when the app is gone (either channel disconnects).
+            while let Ok(()) | Err(RecvTimeoutError::Timeout) =
+                rx_refresh.recv_timeout(POLL_INTERVAL)
+            {
+                if tx_snapshot.send(source.capture()).is_err() {
                     break;
                 }
                 ctx_clone.request_repaint(); // immediately trigger repaint in the GUI thread
-                std::thread::sleep(Duration::from_secs(2));
             }
         });
 
         // Spawn background DNS resolver thread
         let (tx_dns, rx_dns) = std::sync::mpsc::channel::<DnsRequest>();
-        let dns_cache = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // Demo mode never looks anything up; it shows example.com names instead.
+        let seeded_names: HashMap<String, String> = if demo_mode {
+            capture::DEMO_HOSTNAMES
+                .iter()
+                .map(|(addr, name)| (addr.to_string(), name.to_string()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        let dns_cache = std::sync::Arc::new(std::sync::Mutex::new(seeded_names));
         let dns_resolving =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
@@ -231,19 +246,21 @@ impl VtLensApp {
         });
 
         let mut app = Self {
-            processes: Vec::new(),
-            connections: Vec::new(),
+            processes: first.processes,
+            connections: first.connections,
             selected_pid: None,
-            selected_network_inode: None,
+            selected_socket: None,
             process_filter: String::new(),
             network_filter: String::new(),
             explain_prompt: String::new(),
             export_preview: String::new(),
             private_terms: String::new(),
-            status: "Starting capture".to_string(),
+            status: first.status,
+            platform,
             demo_mode,
             auto_refresh: true,
-            tx_snapshot,
+            refresh_requested: false,
+            tx_refresh,
             rx_snapshot,
             api_key: String::new(),
             keyring_status: String::new(),
@@ -272,10 +289,21 @@ impl VtLensApp {
         };
 
         app.update_caches();
-        if !app.demo_mode {
+        if app.keyring_enabled() {
             app.run_keyring_action(KeyringAction::Load, &cc.egui_ctx);
         }
         app
+    }
+
+    /// Demo mode never touches the OS keyring (safe screenshots).
+    fn keyring_enabled(&self) -> bool {
+        !self.demo_mode
+    }
+
+    /// Ask the polling thread for a snapshot now.
+    fn request_refresh(&mut self) {
+        self.refresh_requested = true;
+        let _ = self.tx_refresh.send(());
     }
 
     fn run_keyring_action(&self, action: KeyringAction, ctx: &egui::Context) {
@@ -325,7 +353,7 @@ impl VtLensApp {
 
     fn reset_view(&mut self) {
         self.selected_pid = None;
-        self.selected_network_inode = None;
+        self.selected_socket = None;
         self.process_filter.clear();
         self.network_filter.clear();
         self.net_filter_type = NetFilterType::All;
@@ -334,13 +362,13 @@ impl VtLensApp {
 
     fn clear_selected_process(&mut self) {
         self.selected_pid = None;
-        self.selected_network_inode = None;
+        self.selected_socket = None;
         self.update_caches();
     }
 
     #[allow(dead_code)]
     fn clear_selected_connection(&mut self) {
-        self.selected_network_inode = None;
+        self.selected_socket = None;
         self.update_caches();
     }
 
@@ -463,15 +491,15 @@ impl VtLensApp {
             .collect();
 
         // 4. Validate selected connection matches selected process PID
-        if let Some(inode) = &self.selected_network_inode {
-            if let Some(connection) = self.connections.iter().find(|c| &c.inode == inode) {
+        if let Some(id) = self.selected_socket {
+            if let Some(connection) = self.connections.iter().find(|c| c.socket_id == id) {
                 if let Some(selected_pid) = self.selected_pid
                     && connection.owner.as_ref().map(|owner| owner.pid) != Some(selected_pid)
                 {
-                    self.selected_network_inode = None;
+                    self.selected_socket = None;
                 }
             } else {
-                self.selected_network_inode = None;
+                self.selected_socket = None;
             }
         }
     }
@@ -483,10 +511,11 @@ impl VtLensApp {
 
     fn evidence_input(&self) -> EvidenceInput<'_> {
         EvidenceInput {
+            platform: self.platform,
             processes: &self.processes,
             connections: &self.connections,
             selected_pid: self.selected_pid,
-            selected_inode: self.selected_network_inode.as_deref(),
+            selected_socket: self.selected_socket,
             sample: &self.filtered_connections_cache,
         }
     }
@@ -497,9 +526,16 @@ impl VtLensApp {
     }
 
     fn build_ai_prompt(&self) -> String {
-        let mut prompt = String::from(
-            "You are a Linux security educator and local system observability assistant.\n\n\
-             Explain the following local Linux process and socket evidence in plain Spanish for Argentina/LatAm.\n\n\
+        let os = self.platform.name();
+        let visibility = match self.platform {
+            Platform::Linux => "",
+            Platform::MacOs => {
+                "* Without root, lsof only lists sockets of the user's own processes; other users' and root's sockets are missing\n"
+            }
+        };
+        let mut prompt = format!(
+            "You are a {os} security educator and local system observability assistant.\n\n\
+             Explain the following local {os} process and socket evidence in plain Spanish for Argentina/LatAm.\n\n\
              Rules:\n\
              * Be direct, practical, and technical.\n\
              * Do not invent facts.\n\
@@ -507,11 +543,12 @@ impl VtLensApp {
              * Treat the raw evidence as the source of truth.\n\
              * Explain what is likely happening, what looks normal, what deserves attention, and what the learner should verify manually.\n\
              * If evidence is incomplete, say what is missing.\n\
-             * Always suggest concrete Linux commands to verify the finding manually.\n\
+             * Always suggest concrete {os} commands to verify the finding manually.\n\
              * Keep the tone educational, not alarmist.\n\n\
              System context:\n\
-             * Capture source: /proc\n\
+             * Capture source: {source}\n\
              * No root privileges\n\
+             {visibility}\
              * Connection-level capture only\n\
              * No packet payload inspection\n\
              * No DNS ownership verification unless hostname is present\n\n\
@@ -522,6 +559,7 @@ impl VtLensApp {
              4. Qué merece atención\n\
              5. Cómo verificarlo manualmente\n\
              6. Limitaciones de esta evidencia\n\n",
+            source = self.platform.source_label(),
         );
 
         prompt.push_str("--- REDACTED EVIDENCE ---\n");
@@ -557,30 +595,19 @@ impl VtLensApp {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("VT LENS").strong().size(15.0));
-                ui.label(
-                    RichText::new(if self.demo_mode {
-                        "DEMO · datos sintéticos · sin captura del equipo"
-                    } else {
-                        "Local system visibility · no root · /proc based"
-                    })
-                    .weak()
-                    .size(10.0),
-                );
+                let subtitle = if self.demo_mode {
+                    "DEMO · datos sintéticos · sin captura del equipo".to_string()
+                } else {
+                    format!(
+                        "Local system visibility · no root · {} based",
+                        self.platform.source_label()
+                    )
+                };
+                ui.label(RichText::new(subtitle).weak().size(10.0));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("⟳ Refresh").clicked() {
-                    let tx = self.tx_snapshot.clone();
-                    let ctx = ui.ctx().clone();
-                    let demo_mode = self.demo_mode;
-                    std::thread::spawn(move || {
-                        let snapshot = if demo_mode {
-                            demo_snapshot()
-                        } else {
-                            capture_system_snapshot()
-                        };
-                        let _ = tx.send(snapshot);
-                        ctx.request_repaint();
-                    });
+                    self.request_refresh();
                 }
                 ui.checkbox(&mut self.auto_refresh, "Auto refresh");
             });
@@ -695,7 +722,7 @@ impl VtLensApp {
                         self.clear_selected_process();
                     } else {
                         self.selected_pid = Some(process_pid);
-                        self.selected_network_inode = None;
+                        self.selected_socket = None;
                         self.network_filter.clear();
                     }
                 }
@@ -741,9 +768,12 @@ impl VtLensApp {
                                     RichText::new("🌐 Todas las conexiones").strong().size(13.0),
                                 );
                                 ui.label(
-                                    RichText::new("Mostrando sockets activos desde /proc")
-                                        .weak()
-                                        .size(10.0),
+                                    RichText::new(format!(
+                                        "Mostrando sockets activos desde {}",
+                                        self.platform.source_label()
+                                    ))
+                                    .weak()
+                                    .size(10.0),
                                 );
                             }
                         });
@@ -785,9 +815,10 @@ impl VtLensApp {
                                     RichText::new("🌐 Todas las conexiones").strong().size(13.0),
                                 );
                                 ui.label(
-                                    RichText::new(
-                                        "Mostrando sockets activos capturados desde /proc",
-                                    )
+                                    RichText::new(format!(
+                                        "Mostrando sockets activos capturados desde {}",
+                                        self.platform.source_label()
+                                    ))
                                     .weak()
                                     .size(10.0),
                                 );
@@ -839,7 +870,7 @@ impl VtLensApp {
                         .clicked()
                     {
                         self.selected_pid = None;
-                        self.selected_network_inode = None;
+                        self.selected_socket = None;
                         changed = true;
                     }
                 }
@@ -951,14 +982,7 @@ impl VtLensApp {
                     self.clear_all_filters();
                 }
                 if ui.button("⟳ Refrescar ahora").clicked() {
-                    let tx = self.tx_snapshot.clone();
-                    let ctx = ui.ctx().clone();
-                    let demo_mode = self.demo_mode;
-                    std::thread::spawn(move || {
-                        let snapshot = if demo_mode { demo_snapshot() } else { capture_system_snapshot() };
-                        let _ = tx.send(snapshot);
-                        ctx.request_repaint();
-                    });
+                    self.request_refresh();
                 }
             });
         });
@@ -1098,8 +1122,7 @@ impl VtLensApp {
                             ui.end_row();
 
                             for connection in self.filtered_connections_cache.iter().take(500) {
-                                let selected =
-                                    self.selected_network_inode.as_ref() == Some(&connection.inode);
+                                let selected = self.selected_socket == Some(connection.socket_id);
                                 let mut clicked = false;
 
                                 // Protocol chip cell
@@ -1238,10 +1261,9 @@ impl VtLensApp {
 
                                 if clicked {
                                     if selected {
-                                        self.selected_network_inode = None;
+                                        self.selected_socket = None;
                                     } else {
-                                        self.selected_network_inode =
-                                            Some(connection.inode.clone());
+                                        self.selected_socket = Some(connection.socket_id);
                                         if let Some(ref owner) = connection.owner {
                                             self.selected_pid = Some(owner.pid);
                                         }
@@ -1251,6 +1273,15 @@ impl VtLensApp {
                             }
                         });
                 });
+        }
+    }
+
+    fn ui_commands(ui: &mut egui::Ui, commands: &[String]) {
+        for (index, command) in commands.iter().enumerate() {
+            if index > 0 {
+                ui.add_space(4.0);
+            }
+            Self::ui_copyable_command(ui, command);
         }
     }
 
@@ -1278,7 +1309,7 @@ impl VtLensApp {
             ui.add_space(4.0);
             if ui.button("✕").on_hover_text("Limpiar selección").clicked() {
                 self.selected_pid = None;
-                self.selected_network_inode = None;
+                self.selected_socket = None;
             }
         });
         ui.add_space(8.0);
@@ -1288,8 +1319,8 @@ impl VtLensApp {
 
         // Resolve connection owner if a socket is selected but no process selected
         let mut selected_conn = None;
-        if let Some(inode) = &self.selected_network_inode
-            && let Some(connection) = self.connections.iter().find(|c| &c.inode == inode)
+        if let Some(id) = self.selected_socket
+            && let Some(connection) = self.connections.iter().find(|c| c.socket_id == id)
         {
             selected_conn = Some(connection.clone());
             if focused_pid.is_none()
@@ -1353,7 +1384,7 @@ impl VtLensApp {
                                     EndpointClass::Unknown => "Desconocido",
                                 };
                                 ui.label(RichText::new(format!("Clasificación: {}", class_label)).size(10.0));
-                                ui.label(RichText::new(format!("Inode: {}", conn.inode)).weak().monospace().size(10.0));
+                                ui.label(RichText::new(socket_id_label(conn.socket_id)).weak().monospace().size(10.0));
 
                                 if let Some(owner) = &conn.owner {
                                     ui.add_space(4.0);
@@ -1374,13 +1405,7 @@ impl VtLensApp {
                             .inner_margin(8.0)
                             .show(ui, |ui| {
                                 ui.vertical(|ui| {
-                                    Self::ui_copyable_command(ui, &format!("ss -tunap | grep {}", pid));
-                                    ui.add_space(4.0);
-                                    Self::ui_copyable_command(ui, &format!("lsof -p {} -i", pid));
-                                    ui.add_space(4.0);
-                                    Self::ui_copyable_command(ui, &format!("ps -fp {}", pid));
-                                    ui.add_space(4.0);
-                                    Self::ui_copyable_command(ui, &format!("readlink /proc/{}/fd/* 2>/dev/null | grep 'socket:\\[{}\\]'", pid, conn.inode));
+                                    Self::ui_commands(ui, &connection_commands(self.platform, pid, conn.socket_id));
                                 });
                             });
                         ui.add_space(10.0);
@@ -1451,13 +1476,7 @@ impl VtLensApp {
                         .inner_margin(8.0)
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
-                                Self::ui_copyable_command(ui, &format!("ps -fp {}", p.pid));
-                                ui.add_space(4.0);
-                                Self::ui_copyable_command(ui, &format!("ls -l /proc/{}/fd | grep socket", p.pid));
-                                ui.add_space(4.0);
-                                Self::ui_copyable_command(ui, &format!("ss -tunap | grep {}", p.pid));
-                                ui.add_space(4.0);
-                                Self::ui_copyable_command(ui, &format!("lsof -p {} -i", p.pid));
+                                Self::ui_commands(ui, &process_commands(self.platform, p.pid));
                             });
                         });
                     ui.add_space(10.0);
@@ -1482,7 +1501,7 @@ impl VtLensApp {
                         self.model_name = self.provider.default_model().to_string();
                         self.api_key.clear();
                         self.keyring_status.clear();
-                        if !self.demo_mode && self.provider != LlmProvider::Ollama {
+                        if self.keyring_enabled() && self.provider != LlmProvider::Ollama {
                             self.run_keyring_action(KeyringAction::Load, ui.ctx());
                         }
                     }
@@ -1493,8 +1512,7 @@ impl VtLensApp {
                 if self.provider != LlmProvider::Ollama {
                     ui.add_space(4.0);
                     ui.add(TextEdit::singleline(&mut self.api_key).password(true).hint_text("API Key").desired_width(f32::INFINITY));
-                    // Demo mode never touches the system keyring (safe screenshots).
-                    let keyring_enabled = !self.demo_mode;
+                    let keyring_enabled = self.keyring_enabled();
                     ui.horizontal(|ui| {
                         if ui.add_enabled(keyring_enabled && !self.api_key.trim().is_empty(), egui::Button::new("Guardar en llavero")).clicked() {
                             self.run_keyring_action(KeyringAction::Save(self.api_key.clone()), ui.ctx());
@@ -1569,8 +1587,10 @@ impl VtLensApp {
                             ui.label(RichText::new("• 224.0.0.251:5353 suele ser Multicast DNS (mDNS) para descubrimiento local.").size(10.0));
                         } else {
                             ui.label(RichText::new("• Un proceso puede tener muchos file descriptors (FDs). Algunos FDs representan sockets de red.").size(10.0));
-                            ui.add_space(2.0);
-                            ui.label(RichText::new("• VT Lens mapea inodes de sockets desde /proc/<pid>/fd/ hacia /proc/net/tcp y /proc/net/udp.").size(10.0));
+                            for note in source_notes(self.platform) {
+                                ui.add_space(2.0);
+                                ui.label(RichText::new(*note).size(10.0));
+                            }
                         }
                     });
                 });
@@ -1603,84 +1623,65 @@ impl VtLensApp {
     }
 }
 
-/// Public screenshots use this explicit synthetic dataset; no host telemetry is captured.
-pub fn demo_snapshot() -> ProcSnapshot {
-    let processes = [
-        (1420, "browser", "browser --profile demo", 420_000, 12, 2),
-        (
-            1842,
-            "web-server",
-            "web-server --listen 127.0.0.1:8080",
-            86_000,
-            6,
-            1,
-        ),
-        (2301, "ssh-agent", "ssh-agent", 4_600, 1, 0),
-        (2714, "database", "database --config demo", 152_000, 8, 1),
-        (3380, "vt-lens", "vt-lens --demo", 74_000, 5, 0),
-    ]
-    .into_iter()
-    .map(
-        |(pid, name, cmdline, rss_kb, threads, socket_count)| ProcessRow {
-            pid,
-            name: name.into(),
-            cmdline: cmdline.into(),
-            state: "S".into(),
-            rss_kb,
-            threads,
-            socket_count,
-            uid: Some(1000),
-        },
-    )
-    .collect();
-    let connections = [
-        (
-            "tcp",
-            "127.0.0.1:8080",
-            "0.0.0.0:0",
-            "LISTEN",
-            1842,
-            "web-server",
-        ),
-        (
-            "tcp",
-            "192.0.2.10:53918",
-            "198.51.100.42:443",
-            "ESTABLISHED",
-            1420,
-            "browser",
-        ),
-        (
-            "tcp",
-            "127.0.0.1:5432",
-            "0.0.0.0:0",
-            "LISTEN",
-            2714,
-            "database",
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    .map(
-        |(index, (protocol, local_addr, remote_addr, state, pid, process))| NetRow {
-            protocol: protocol.into(),
-            local_addr: local_addr.into(),
-            remote_addr: remote_addr.into(),
-            state: state.into(),
-            tx_queue: 0,
-            rx_queue: 0,
-            inode: format!("demo-{index}"),
-            owner: Some(crate::model::SocketOwner {
-                pid,
-                process: process.into(),
-            }),
-        },
-    )
-    .collect();
-    ProcSnapshot {
-        processes,
-        connections,
-        status: "DEMO · datos sintéticos · sin captura del equipo".into(),
+/// Linux shows the inode, macOS the owner's file descriptor.
+fn socket_id_label(id: SocketId) -> String {
+    match id {
+        SocketId::Inode(inode) => format!("Inode: {inode}"),
+        SocketId::Fd { pid, fd } => format!("FD: {fd} (PID {pid})"),
+    }
+}
+
+/// Commands to check a process by hand, with the tools each OS ships.
+fn process_commands(platform: Platform, pid: u32) -> Vec<String> {
+    match platform {
+        Platform::Linux => vec![
+            format!("ps -fp {pid}"),
+            format!("ls -l /proc/{pid}/fd | grep socket"),
+            format!("ss -tunap | grep {pid}"),
+            format!("lsof -p {pid} -i"),
+        ],
+        Platform::MacOs => vec![
+            format!("ps -fp {pid}"),
+            format!("lsof -nP -a -p {pid} -i"),
+            format!("lsof -nP -a -p {pid} -U"),
+            format!("netstat -anv | grep ':{pid} '"),
+        ],
+    }
+}
+
+/// Commands to check one socket of `pid` by hand.
+fn connection_commands(platform: Platform, pid: u32, socket: SocketId) -> Vec<String> {
+    let mut commands = match platform {
+        Platform::Linux => vec![
+            format!("ss -tunap | grep {pid}"),
+            format!("lsof -p {pid} -i"),
+            format!("ps -fp {pid}"),
+        ],
+        Platform::MacOs => vec![
+            format!("lsof -nP -a -p {pid} -i"),
+            format!("ps -fp {pid}"),
+            format!("netstat -anv | grep ':{pid} '"),
+        ],
+    };
+    match socket {
+        SocketId::Inode(inode) => commands.push(format!(
+            "readlink /proc/{pid}/fd/* 2>/dev/null | grep 'socket:\\[{inode}\\]'"
+        )),
+        SocketId::Fd { fd, .. } => commands.insert(1, format!("lsof -nP -a -p {pid} -d {fd}")),
+    }
+    commands
+}
+
+/// Learning-mode notes on where the tables come from.
+fn source_notes(platform: Platform) -> &'static [&'static str] {
+    match platform {
+        Platform::Linux => &[
+            "• VT Lens mapea inodes de sockets desde /proc/<pid>/fd/ hacia /proc/net/tcp y /proc/net/udp.",
+        ],
+        Platform::MacOs => &[
+            "• macOS no tiene /proc: VT Lens lista los procesos con libproc y los sockets TCP/UDP con lsof.",
+            "• Sin sudo, lsof solo ve los sockets de tus propios procesos; los de root y otros usuarios no aparecen. netstat -anv sí los lista con proceso:pid.",
+        ],
     }
 }
 
@@ -1692,13 +1693,14 @@ impl eframe::App for VtLensApp {
         let prev_net_filter = self.network_filter.clone();
         let prev_net_filter_type = self.net_filter_type;
         let prev_selected_pid = self.selected_pid;
-        let prev_selected_inode = self.selected_network_inode.clone();
+        let prev_selected_socket = self.selected_socket;
         let prev_only_active = self.only_network_active;
 
         // Poll for snapshots from background thread
         if let Ok(snapshot) = self.rx_snapshot.try_recv()
-            && self.auto_refresh
+            && (self.auto_refresh || self.refresh_requested)
         {
+            self.refresh_requested = false;
             self.processes = snapshot.processes;
             self.connections = snapshot.connections;
             self.status = snapshot.status;
@@ -1778,8 +1780,13 @@ impl eframe::App for VtLensApp {
                     };
 
                     let status_text = format!(
-                        "{} procesos · {} sockets · {} visibles{} · último escaneo hace {}s · /proc no root",
-                        total_proc, total_sock, visible_sock, selection_info, age
+                        "{} procesos · {} sockets · {} visibles{} · último escaneo hace {}s · {} no root",
+                        total_proc,
+                        total_sock,
+                        visible_sock,
+                        selection_info,
+                        age,
+                        self.platform.source_label()
                     );
                     ui.label(RichText::new(status_text).weak().size(11.0));
                 });
@@ -1798,7 +1805,7 @@ impl eframe::App for VtLensApp {
             .show(ui, |ui| self.show_processes(ui));
 
         // Right Inspector Panel (collapsible slide-out)
-        let show_inspector = self.selected_pid.is_some() || self.selected_network_inode.is_some();
+        let show_inspector = self.selected_pid.is_some() || self.selected_socket.is_some();
         if show_inspector {
             egui::Panel::right("inspector")
                 .resizable(true)
@@ -1830,7 +1837,7 @@ impl eframe::App for VtLensApp {
             || self.network_filter != prev_net_filter
             || self.net_filter_type != prev_net_filter_type
             || self.selected_pid != prev_selected_pid
-            || self.selected_network_inode != prev_selected_inode
+            || self.selected_socket != prev_selected_socket
             || self.only_network_active != prev_only_active
         {
             self.update_caches();
@@ -2024,31 +2031,4 @@ fn perform_llm_stream_request(
     }
 
     Ok(())
-}
-
-pub fn capture_system_snapshot() -> ProcSnapshot {
-    let owners = socket_owners();
-    let mut processes = read_processes();
-    let mut socket_counts: HashMap<u32, usize> = HashMap::new();
-
-    for owner in owners.values() {
-        *socket_counts.entry(owner.pid).or_default() += 1;
-    }
-
-    for process in &mut processes {
-        process.socket_count = socket_counts.get(&process.pid).copied().unwrap_or(0);
-    }
-
-    let connections = read_connections(&owners);
-    let status = format!(
-        "{} processes · {} connections · connection-level capture (no root)",
-        processes.len(),
-        connections.len()
-    );
-
-    ProcSnapshot {
-        processes,
-        connections,
-        status,
-    }
 }

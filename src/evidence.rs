@@ -2,7 +2,8 @@
 //!
 //! It is built from an allowlist of structured fields instead of scrubbing free
 //! text: the process basename (sanitized), PID and resource counters, the UID
-//! *class*, protocol, socket state, inode, and each endpoint reduced to its
+//! *class*, protocol, socket state, socket id (inode on Linux, fd on macOS),
+//! and each endpoint reduced to its
 //! address class plus port. Command lines, raw IPs, hostnames and account
 //! names never enter it, so there is nothing for a redaction pattern to miss.
 //! The free-text redaction in `redaction.rs` still runs over the final prompt,
@@ -10,7 +11,8 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use crate::model::{NetRow, ProcessRow};
+use crate::capture::Platform;
+use crate::model::{NetRow, ProcessRow, SocketId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndpointClass {
@@ -132,29 +134,31 @@ fn safe_token(value: &str, max: usize) -> String {
         .collect()
 }
 
-fn safe_digits(value: &str) -> String {
-    value
-        .chars()
-        .filter(char::is_ascii_digit)
-        .take(20)
-        .collect()
-}
-
-pub fn uid_class(uid: Option<u32>) -> &'static str {
+/// Linux: below 1000 is a system account; macOS: below 501.
+pub fn uid_class(platform: Platform, uid: Option<u32>) -> &'static str {
     match uid {
         None => "desconocido",
         Some(0) => "root",
-        Some(65534) => "nobody",
-        Some(1..=999) => "sistema",
+        Some(uid) if uid == platform.nobody_uid() => "nobody",
+        Some(uid) if uid < platform.first_user_uid() => "sistema",
         Some(_) => "usuario",
     }
 }
 
+/// The socket's key and its value: `inode` on Linux, `fd` on macOS.
+fn socket_field(id: SocketId) -> (&'static str, String) {
+    match id {
+        SocketId::Inode(inode) => ("inode", inode.to_string()),
+        SocketId::Fd { fd, .. } => ("fd", fd.to_string()),
+    }
+}
+
 pub struct EvidenceInput<'a> {
+    pub platform: Platform,
     pub processes: &'a [ProcessRow],
     pub connections: &'a [NetRow],
     pub selected_pid: Option<u32>,
-    pub selected_inode: Option<&'a str>,
+    pub selected_socket: Option<SocketId>,
     /// Connections currently shown (filters applied); used when no process is selected.
     pub sample: &'a [NetRow],
 }
@@ -164,13 +168,15 @@ fn owner_pid(conn: &NetRow) -> Option<u32> {
 }
 
 fn connection_line(conn: &NetRow) -> String {
+    let (key, value) = socket_field(conn.socket_id);
     format!(
-        "{} {} -> {} [{}] inode={}",
+        "{} {} -> {} [{}] {}={}",
         safe_token(&conn.protocol, 8),
         endpoint_label(&conn.local_addr, true),
         endpoint_label(&conn.remote_addr, false),
         safe_token(&conn.state, 16),
-        safe_digits(&conn.inode),
+        key,
+        value,
     )
 }
 
@@ -186,7 +192,8 @@ fn push_selected_connection(out: &mut String, conn: &NetRow) {
         endpoint_label(&conn.remote_addr, false)
     ));
     out.push_str(&format!("* state: {}\n", safe_token(&conn.state, 16)));
-    out.push_str(&format!("* inode: {}\n", safe_digits(&conn.inode)));
+    let (key, value) = socket_field(conn.socket_id);
+    out.push_str(&format!("* {key}: {value}\n"));
     out.push_str(&format!(
         "* classification: {:?}\n\n",
         classify(&conn.remote_addr)
@@ -196,8 +203,8 @@ fn push_selected_connection(out: &mut String, conn: &NetRow) {
 pub fn build_evidence(input: &EvidenceInput) -> String {
     let mut out = String::new();
     let selected_conn = input
-        .selected_inode
-        .and_then(|inode| input.connections.iter().find(|c| c.inode == inode));
+        .selected_socket
+        .and_then(|id| input.connections.iter().find(|c| c.socket_id == id));
 
     let Some(pid) = input.selected_pid else {
         out.push_str("No process selected.\n\n");
@@ -214,7 +221,7 @@ pub fn build_evidence(input: &EvidenceInput) -> String {
                 .as_ref()
                 .map(|o| format!("{} ({})", safe_process_name(&o.process), o.pid))
                 .unwrap_or_else(|| "unknown".to_string());
-            let marker = if Some(conn.inode.as_str()) == input.selected_inode {
+            let marker = if Some(conn.socket_id) == input.selected_socket {
                 " [SELECTED_CONNECTION]"
             } else {
                 ""
@@ -245,7 +252,10 @@ pub fn build_evidence(input: &EvidenceInput) -> String {
                 safe_process_name(&p.name)
             ));
             out.push_str(&format!("* state: {}\n", safe_token(&p.state, 24)));
-            out.push_str(&format!("* uid_class: {}\n", uid_class(p.uid)));
+            out.push_str(&format!(
+                "* uid_class: {}\n",
+                uid_class(input.platform, p.uid)
+            ));
             out.push_str(&format!("* rss_mb: {:.1}\n", p.rss_mb()));
             out.push_str(&format!("* threads: {}\n", p.threads));
             out.push_str(&format!("* sockets_reported: {}\n", p.socket_count));
@@ -304,7 +314,7 @@ pub fn build_evidence(input: &EvidenceInput) -> String {
         );
     }
     for (idx, conn) in pid_conns.iter().take(20).enumerate() {
-        let marker = if Some(conn.inode.as_str()) == input.selected_inode {
+        let marker = if Some(conn.socket_id) == input.selected_socket {
             " [SELECTED_CONNECTION]"
         } else {
             ""
@@ -333,8 +343,8 @@ pub fn build_markdown(input: &EvidenceInput, status: &str) -> String {
 
     let focused_pid = input.selected_pid.or_else(|| {
         input
-            .selected_inode
-            .and_then(|inode| input.connections.iter().find(|c| c.inode == inode))
+            .selected_socket
+            .and_then(|id| input.connections.iter().find(|c| c.socket_id == id))
             .and_then(owner_pid)
     });
     if let Some(pid) = focused_pid {
@@ -343,7 +353,10 @@ pub fn build_markdown(input: &EvidenceInput, status: &str) -> String {
         if let Some(p) = input.processes.iter().find(|p| p.pid == pid) {
             md.push_str(&format!("- Comm: {}\n", safe_process_name(&p.name)));
             md.push_str(&format!("- State: {}\n", safe_token(&p.state, 24)));
-            md.push_str(&format!("- UID class: {}\n", uid_class(p.uid)));
+            md.push_str(&format!(
+                "- UID class: {}\n",
+                uid_class(input.platform, p.uid)
+            ));
             md.push_str(&format!("- RSS: {:.1} MB\n", p.rss_mb()));
             md.push_str(&format!("- Threads: {}\n", p.threads));
             md.push_str(&format!("- Sockets: {}\n", p.socket_count));
@@ -352,8 +365,8 @@ pub fn build_markdown(input: &EvidenceInput, status: &str) -> String {
     }
 
     if let Some(conn) = input
-        .selected_inode
-        .and_then(|inode| input.connections.iter().find(|c| c.inode == inode))
+        .selected_socket
+        .and_then(|id| input.connections.iter().find(|c| c.socket_id == id))
     {
         md.push_str("## Focused Network Connection\n\n");
         md.push_str(&format!("- Protocol: {}\n", safe_token(&conn.protocol, 8)));
@@ -372,7 +385,10 @@ pub fn build_markdown(input: &EvidenceInput, status: &str) -> String {
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "unknown".into())
         ));
-        md.push_str(&format!("- Inode: {}\n", safe_digits(&conn.inode)));
+        match conn.socket_id {
+            SocketId::Inode(inode) => md.push_str(&format!("- Inode: {inode}\n")),
+            SocketId::Fd { fd, .. } => md.push_str(&format!("- FD: {fd}\n")),
+        }
         md.push_str(&format!(
             "- Queues: tx={} rx={}\n\n",
             conn.tx_queue, conn.rx_queue
@@ -402,14 +418,7 @@ mod tests {
     use super::*;
     use crate::model::SocketOwner;
 
-    fn conn(
-        local: &str,
-        remote: &str,
-        state: &str,
-        pid: u32,
-        process: &str,
-        inode: &str,
-    ) -> NetRow {
+    fn conn(local: &str, remote: &str, state: &str, pid: u32, process: &str, inode: u64) -> NetRow {
         NetRow {
             protocol: "tcp".into(),
             local_addr: local.into(),
@@ -417,7 +426,7 @@ mod tests {
             state: state.into(),
             tx_queue: 0,
             rx_queue: 0,
-            inode: inode.into(),
+            socket_id: SocketId::Inode(inode),
             owner: Some(SocketOwner {
                 pid,
                 process: process.into(),
@@ -468,10 +477,17 @@ mod tests {
 
     #[test]
     fn uid_and_names_are_reduced() {
-        assert_eq!(uid_class(Some(0)), "root");
-        assert_eq!(uid_class(Some(110)), "sistema");
-        assert_eq!(uid_class(Some(1000)), "usuario");
-        assert_eq!(uid_class(None), "desconocido");
+        let linux = Platform::Linux;
+        assert_eq!(uid_class(linux, Some(0)), "root");
+        assert_eq!(uid_class(linux, Some(110)), "sistema");
+        assert_eq!(uid_class(linux, Some(1000)), "usuario");
+        assert_eq!(uid_class(linux, Some(65534)), "nobody");
+        assert_eq!(uid_class(linux, None), "desconocido");
+        let mac = Platform::MacOs;
+        assert_eq!(uid_class(mac, Some(0)), "root");
+        assert_eq!(uid_class(mac, Some(270)), "sistema");
+        assert_eq!(uid_class(mac, Some(501)), "usuario");
+        assert_eq!(uid_class(mac, Some(u32::MAX - 1)), "nobody");
         assert_eq!(safe_process_name("node\nKEY=x"), "node_KEY_x");
         assert_eq!(safe_process_name("\u{1b}\u{1b}"), "(sin nombre)");
         assert_eq!(safe_process_name(&"a".repeat(80)).len(), 32);
@@ -500,23 +516,17 @@ mod tests {
                 "ESTABLISHED",
                 4242,
                 "agent",
-                "111",
+                111,
             ),
-            conn(
-                "127.0.0.1:8080",
-                "0.0.0.0:0",
-                "LISTEN",
-                4242,
-                "agent",
-                "222",
-            ),
+            conn("127.0.0.1:8080", "0.0.0.0:0", "LISTEN", 4242, "agent", 222),
         ];
         for selected_pid in [Some(4242), None] {
             let input = EvidenceInput {
+                platform: Platform::Linux,
                 processes: &processes,
                 connections: &connections,
                 selected_pid,
-                selected_inode: Some("111"),
+                selected_socket: Some(SocketId::Inode(111)),
                 sample: &connections,
             };
             for text in [
@@ -542,14 +552,46 @@ mod tests {
             }
         }
         let evidence = build_evidence(&EvidenceInput {
+            platform: Platform::Linux,
             processes: &processes,
             connections: &connections,
             selected_pid: Some(4242),
-            selected_inode: None,
+            selected_socket: None,
             sample: &connections,
         });
         assert!(evidence.contains("* comm (binario): agent"));
         assert!(evidence.contains("* uid_class: usuario"));
         assert!(evidence.contains("* external: 1"));
+        assert!(evidence.contains("[ESTABLISHED] inode=111"), "{evidence}");
+    }
+
+    /// macOS rows carry the owner's fd instead of an inode.
+    #[test]
+    fn macos_sockets_are_labelled_by_fd() {
+        let mut row = conn(
+            "192.0.2.10:53918",
+            "198.51.100.42:443",
+            "ESTABLISHED",
+            77,
+            "agent",
+            0,
+        );
+        row.socket_id = SocketId::Fd { pid: 77, fd: 23 };
+        let rows = vec![row];
+        let input = EvidenceInput {
+            platform: Platform::MacOs,
+            processes: &[],
+            connections: &rows,
+            selected_pid: None,
+            selected_socket: Some(SocketId::Fd { pid: 77, fd: 23 }),
+            sample: &rows,
+        };
+        let evidence = build_evidence(&input);
+        assert!(evidence.contains("* fd: 23"), "{evidence}");
+        assert!(
+            evidence.contains("fd=23 owner=agent (77) [SELECTED_CONNECTION]"),
+            "{evidence}"
+        );
+        assert!(build_markdown(&input, "demo").contains("- FD: 23"));
     }
 }

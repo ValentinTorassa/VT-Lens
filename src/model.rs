@@ -1,3 +1,5 @@
+use std::fmt;
+
 #[derive(Clone, Debug, Default)]
 pub struct ProcessRow {
     pub pid: u32,
@@ -7,7 +9,8 @@ pub struct ProcessRow {
     pub rss_kb: u64,
     pub threads: u32,
     pub socket_count: usize,
-    /// Real UID from /proc/<pid>/status; only its class leaves the app.
+    /// Real UID (/proc/<pid>/status on Linux, libproc on macOS); only its
+    /// class leaves the app.
     pub uid: Option<u32>,
 }
 
@@ -28,6 +31,26 @@ pub struct SocketOwner {
     pub process: String,
 }
 
+/// Identifies one socket within a snapshot.
+///
+/// Linux names a socket by its inode: `/proc/<pid>/fd/N -> socket:[inode]`
+/// links the process to its row in `/proc/net/tcp`. macOS has no such table;
+/// `lsof` reports each socket as a file descriptor of its owning process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SocketId {
+    Inode(u64),
+    Fd { pid: u32, fd: u32 },
+}
+
+impl fmt::Display for SocketId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inode(inode) => write!(f, "inode {inode}"),
+            Self::Fd { fd, .. } => write!(f, "fd {fd}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NetRow {
     pub protocol: String,
@@ -36,7 +59,7 @@ pub struct NetRow {
     pub state: String,
     pub tx_queue: u64,
     pub rx_queue: u64,
-    pub inode: String,
+    pub socket_id: SocketId,
     pub owner: Option<SocketOwner>,
 }
 

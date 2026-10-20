@@ -1,3 +1,5 @@
+//! Linux processes: one `/proc/<pid>` directory each (`comm`, `cmdline`, `status`).
+
 use std::fs;
 use std::path::Path;
 

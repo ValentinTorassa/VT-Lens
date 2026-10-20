@@ -13,9 +13,16 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    // --demo: synthetic data for screenshots and videos; nothing is captured.
+    let source = if std::env::args().any(|arg| arg == "--demo") {
+        capture::demo_source(capture::Platform::host())
+    } else {
+        capture::system_source()
+    };
+
     eframe::run_native(
         "VT Lens",
         options,
-        Box::new(|cc| Ok(Box::new(app::VtLensApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(app::VtLensApp::new(cc, source)))),
     )
 }
