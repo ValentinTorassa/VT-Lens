@@ -35,19 +35,11 @@ jobs:
 
       # Reads Cargo.lock against the RustSec advisory database. Fails on any
       # vulnerability; unmaintained or yanked crates are printed as warnings.
-      # Allowlisted, so they warn instead of failing. Each one is dated; drop it
-      # once the fix lands (cargo audit then reports nothing for it):
-      # - RUSTSEC-2026-0257 (GHSA-2ph8-5cr8-hr33), webbrowser 0.8.15, added 2026-10-14:
-      #   argument injection through the BROWSER template when an app opens
-      #   an attacker-controlled non-HTTP URL with spaces. It comes in
-      #   through eframe 0.27 (egui-winit), which calls it only when the UI
-      #   opens a link, and vt-lens has no hyperlink or OpenUrl anywhere in
-      #   src/. The fix is webbrowser 1.2.2, which needs an eframe upgrade
-      #   past 0.27 (breaking).
+      # Nothing is allowlisted. (RUSTSEC-2026-0257, webbrowser 0.8.15 via
+      # eframe 0.27, was allowlisted from 2026-10-14 until the upgrade to
+      # eframe 0.36, which locks webbrowser 1.2.4.)
       - name: cargo audit
-        run: |
-          echo "::warning title=Allowlisted RUSTSEC-2026-0257::webbrowser 0.8.15 (GHSA-2ph8-5cr8-hr33), allowlisted 2026-10-14: via eframe 0.27; vt-lens never opens a URL; the fix needs an eframe upgrade past 0.27 (breaking)"
-          cargo audit --ignore RUSTSEC-2026-0257
+        run: cargo audit
 
   codeql:
     name: CodeQL (${{ matrix.language }})

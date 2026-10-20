@@ -1,14 +1,25 @@
 [package]
 name = "vt-lens"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "A minimal native lens for understanding local process and network activity."
 
 [dependencies]
-eframe = "0.27"
+eframe = "0.36.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ureq = { version = "2.9", features = ["json"] }
 dns-lookup = "4.0"
 regex = "1"
+# Only for the `screenshots` feature (README images); see src/app/screenshots.rs.
+egui_kittest = { version = "0.36.2", optional = true, features = ["eframe", "wgpu"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+
+[features]
+# cargo test --features screenshots screenshots  -> docs/screenshots/*.png
+screenshots = ["dep:egui_kittest", "dep:image"]

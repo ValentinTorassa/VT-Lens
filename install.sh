@@ -20,11 +20,13 @@ Uso: install.sh [opciones]
 
 Instala VT Lens. Primero intenta descargar el binario precompilado de la última
 release de GitHub (verificando su SHA256); si no hay uno para tu sistema, compila
-desde el código fuente con Cargo.
+desde el código fuente con Cargo. Hay binarios para Linux x86_64 y macOS (Apple
+Silicon e Intel).
 
 Opciones:
   --from-source    Compila desde el código fuente aunque exista un binario precompilado.
-  --prefix DIR     Instala en DIR/bin y DIR/share/applications (por defecto: \$HOME/.local).
+  --prefix DIR     Instala en DIR/bin (y en Linux, el lanzador en DIR/share/applications).
+                   Por defecto: \$HOME/.local.
   --dry-run        Muestra lo que haría sin instalar ni compilar nada. Las descargas
                    van a un directorio temporal que se borra al terminar.
   -h, --help       Muestra esta ayuda.
@@ -56,6 +58,7 @@ done
 
 BIN_DIR="$PREFIX/bin"
 APP_DIR="$PREFIX/share/applications"
+OS="$(uname -s)"
 
 # Temporary directories are removed on exit.
 TEMP_DIRS=()
@@ -92,15 +95,16 @@ install_files() {
     local desktop_src="$2"
 
     run mkdir -p "$BIN_DIR"
-    run mkdir -p "$APP_DIR"
 
     echo -e "${BLUE}Instalando binario ejecutable...${NC}"
     run cp "$bin_src" "$BIN_DIR/vt-lens"
     run chmod +x "$BIN_DIR/vt-lens"
     echo -e "${GREEN}✓ Ejecutable instalado en: $BIN_DIR/vt-lens${NC}"
 
-    if [ -f "$desktop_src" ]; then
+    # The .desktop launcher is for Linux application menus; macOS has none.
+    if [ "$OS" = "Linux" ] && [ -f "$desktop_src" ]; then
         echo -e "${BLUE}Instalando acceso directo de escritorio...${NC}"
+        run mkdir -p "$APP_DIR"
         run cp "$desktop_src" "$APP_DIR/vt-lens.desktop"
         run chmod +x "$APP_DIR/vt-lens.desktop"
         echo -e "${GREEN}✓ Acceso directo instalado en: $APP_DIR/vt-lens.desktop${NC}"
@@ -109,8 +113,18 @@ install_files() {
 
 # Maps this machine to the target triple used in release asset names.
 detect_target() {
-    case "$(uname -s)-$(uname -m)" in
+    case "$OS-$(uname -m)" in
         Linux-x86_64|Linux-amd64) echo "x86_64-unknown-linux-gnu" ;;
+        Darwin-arm64) echo "aarch64-apple-darwin" ;;
+        Darwin-x86_64)
+            # A shell running under Rosetta reports x86_64 on Apple Silicon;
+            # the native arm64 build is the better fit there.
+            if [ "$(sysctl -in hw.optional.arm64 2>/dev/null)" = "1" ]; then
+                echo "aarch64-apple-darwin"
+            else
+                echo "x86_64-apple-darwin"
+            fi
+            ;;
         *) return 1 ;;
     esac
 }
@@ -243,7 +257,11 @@ install_from_source() {
             echo -e "${GREEN}✓ Compilación completada con éxito.${NC}"
         else
             echo -e "${RED}Error: La compilación falló.${NC}"
-            echo -e "Asegúrate de tener instaladas las dependencias gráficas necesarias de egui/eframe."
+            if [ "$OS" = "Darwin" ]; then
+                echo -e "En macOS hacen falta las Command Line Tools de Xcode: xcode-select --install"
+            else
+                echo -e "Asegúrate de tener instaladas las dependencias gráficas necesarias de egui/eframe."
+            fi
             exit 1
         fi
     fi
@@ -273,5 +291,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
     echo -e "\n${GREEN}=== Dry run terminado: no se instaló nada. ===${NC}"
 else
     echo -e "\n${GREEN}=== ¡Instalación Completada! ===${NC}"
-    echo -e "Ahora puedes buscar 'VT Lens' en el menú de aplicaciones de tu escritorio o ejecutarlo desde la terminal con: vt-lens"
+    if [ "$OS" = "Linux" ]; then
+        echo -e "Ahora puedes buscar 'VT Lens' en el menú de aplicaciones de tu escritorio o ejecutarlo desde la terminal con: vt-lens"
+    else
+        echo -e "Ejecutalo desde la terminal con: vt-lens"
+    fi
 fi

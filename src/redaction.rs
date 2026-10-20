@@ -54,7 +54,11 @@ fn redact_ipv6(text: &str) -> String {
             let candidate = run.trim_end_matches('.');
             let before_ok = start == 0 || !word(bytes[start - 1]);
             let after_ok = i >= bytes.len() || !word(bytes[i]);
-            if before_ok && after_ok && candidate.matches(':').count() >= 2 && candidate.parse::<Ipv6Addr>().is_ok() {
+            if before_ok
+                && after_ok
+                && candidate.matches(':').count() >= 2
+                && candidate.parse::<Ipv6Addr>().is_ok()
+            {
                 out.push_str("[IPv6 redactada]");
                 out.push_str(&run[candidate.len()..]);
             } else {
@@ -106,18 +110,27 @@ fn redact_high_entropy(text: &str) -> String {
 
 /// Sanitize text that will leave the local process, including editable previews.
 pub fn redact(text: &str) -> String {
-    let clean = rules().iter().fold(text.to_owned(), |current, (pattern, replacement)| {
-        pattern.replace_all(&current, *replacement).into_owned()
-    });
+    let clean = rules()
+        .iter()
+        .fold(text.to_owned(), |current, (pattern, replacement)| {
+            pattern.replace_all(&current, *replacement).into_owned()
+        });
     redact_high_entropy(&redact_ipv6(&clean))
 }
 
 /// Private terms are session-local, separated by commas or newlines and never persisted.
 pub fn redact_with_terms(text: &str, private_terms: &str) -> String {
     let mut clean = redact(text);
-    for term in private_terms.split([',', '\n']).map(str::trim).filter(|term| !term.is_empty()) {
-        let pattern = Regex::new(&format!("(?i){}", regex::escape(term))).expect("escaped private term");
-        clean = pattern.replace_all(&clean, "[término privado]").into_owned();
+    for term in private_terms
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+    {
+        let pattern =
+            Regex::new(&format!("(?i){}", regex::escape(term))).expect("escaped private term");
+        clean = pattern
+            .replace_all(&clean, "[término privado]")
+            .into_owned();
     }
     clean
 }
@@ -140,7 +153,17 @@ mod tests {
                    Authorization: Bearer syntheticbearervalue12345\n\
                    owner@example.test";
         let clean = redact(raw);
-        assert_hidden(&clean, &["synthetic-secret", "/home/test", "203.0.113.7", "2001:db8", "syntheticbearervalue12345", "owner@example.test"]);
+        assert_hidden(
+            &clean,
+            &[
+                "synthetic-secret",
+                "/home/test",
+                "203.0.113.7",
+                "2001:db8",
+                "syntheticbearervalue12345",
+                "owner@example.test",
+            ],
+        );
         assert!(clean.contains(":443"));
         assert!(clean.contains(":8080"));
     }
@@ -149,8 +172,17 @@ mod tests {
     fn structured_fields_and_private_canaries_do_not_leave_the_preview() {
         let raw = "* name: private-project-agent\n- Cmdline: `tool --password=\"two word secret\"`\n- Owner: private-user\n* password: \"two word secret\"\n* remote: 203.0.113.9:443\nPrivateProject";
         let clean = redact_with_terms(raw, "PrivateProject, private-project-agent");
-        for canary in ["private-project-agent", "private-user", "two word secret", "203.0.113.9", "PrivateProject"] {
-            assert!(!clean.to_lowercase().contains(&canary.to_lowercase()), "leaked: {canary}; preview: {clean}");
+        for canary in [
+            "private-project-agent",
+            "private-user",
+            "two word secret",
+            "203.0.113.9",
+            "PrivateProject",
+        ] {
+            assert!(
+                !clean.to_lowercase().contains(&canary.to_lowercase()),
+                "leaked: {canary}; preview: {clean}"
+            );
         }
         assert!(clean.contains(":443"));
     }
@@ -159,7 +191,16 @@ mod tests {
     #[test]
     fn env_style_key_names_are_redacted_on_any_line() {
         let raw = "bash -c echo start\nexport OPENAI_API_KEY=sk-canary-aaaaaaaaaaaaaaaaaaaa\nGITHUB_TOKEN=ghp_canarycanarycanarycanary1234\nAWS_SECRET_ACCESS_KEY: wJalrXUtnFEMIcanary\nDB_PASS=hunter2canary\nmy.api_key = 'quoted canary'";
-        assert_hidden(&redact(raw), &["sk-canary", "ghp_canary", "wJalrXUtnFEMIcanary", "hunter2canary", "quoted canary"]);
+        assert_hidden(
+            &redact(raw),
+            &[
+                "sk-canary",
+                "ghp_canary",
+                "wJalrXUtnFEMIcanary",
+                "hunter2canary",
+                "quoted canary",
+            ],
+        );
     }
 
     #[test]
@@ -169,7 +210,19 @@ mod tests {
                    AKIAABCDEFGHIJKLMNOP xoxb-12345-canarycanary AIzaSyA1234567890abcdefghijklmnopqrstu\n\
                    github_pat_11ABCDEFG0canarycanarycanary";
         let clean = redact(raw);
-        assert_hidden(&clean, &["s3cretCanary", "k3yCanary", "tokCanary", "pwCanary", "AKIAABCDEFGHIJKLMNOP", "xoxb-12345", "AIzaSyA123", "github_pat_11"]);
+        assert_hidden(
+            &clean,
+            &[
+                "s3cretCanary",
+                "k3yCanary",
+                "tokCanary",
+                "pwCanary",
+                "AKIAABCDEFGHIJKLMNOP",
+                "xoxb-12345",
+                "AIzaSyA123",
+                "github_pat_11",
+            ],
+        );
         assert!(clean.contains("postgres://"));
         assert!(clean.contains("db.internal:5432"));
     }
@@ -185,7 +238,9 @@ mod tests {
 
     #[test]
     fn ipv6_redaction_leaves_times_macs_and_paths_alone() {
-        let clean = redact("at 12:34:56 mac aa:bb:cc:dd:ee:ff use std::sync::Mutex; peer [::1]:631 and fe80::1 and ::ffff:10.0.0.1");
+        let clean = redact(
+            "at 12:34:56 mac aa:bb:cc:dd:ee:ff use std::sync::Mutex; peer [::1]:631 and fe80::1 and ::ffff:10.0.0.1",
+        );
         assert!(clean.contains("12:34:56"), "{clean}");
         assert!(clean.contains("aa:bb:cc:dd:ee:ff"), "{clean}");
         assert!(clean.contains("std::sync::Mutex"), "{clean}");

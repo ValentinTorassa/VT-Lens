@@ -1,11 +1,17 @@
+//! Linux sockets: `/proc/net/{tcp,udp,tcp6,udp6}` list every socket by inode,
+//! and `/proc/<pid>/fd/*` links (`socket:[inode]`) tie each inode to a process.
+
+// On macOS this module is compiled only for its unit tests.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
 use super::strip_control;
-use crate::model::{NetRow, SocketOwner};
+use crate::model::{NetRow, SocketId, SocketOwner};
 
-pub fn socket_owners() -> HashMap<String, SocketOwner> {
+pub fn socket_owners() -> HashMap<u64, SocketOwner> {
     let Ok(entries) = fs::read_dir("/proc") else {
         return HashMap::new();
     };
@@ -50,7 +56,7 @@ pub fn socket_owners() -> HashMap<String, SocketOwner> {
     owners
 }
 
-pub fn read_connections(owners: &HashMap<String, SocketOwner>) -> Vec<NetRow> {
+pub fn read_connections(owners: &HashMap<u64, SocketOwner>) -> Vec<NetRow> {
     let sources = [
         ("/proc/net/tcp", "tcp", false),
         ("/proc/net/udp", "udp", false),
@@ -81,25 +87,25 @@ pub fn read_connections(owners: &HashMap<String, SocketOwner>) -> Vec<NetRow> {
     rows
 }
 
-fn socket_inode_from_link(target: PathBuf) -> Option<String> {
+fn socket_inode_from_link(target: PathBuf) -> Option<u64> {
     let text = target.to_string_lossy();
     text.strip_prefix("socket:[")
         .and_then(|value| value.strip_suffix(']'))
-        .map(ToOwned::to_owned)
+        .and_then(|value| value.parse().ok())
 }
 
 fn parse_proc_net_line(
     line: &str,
     protocol: &str,
     ipv6: bool,
-    owners: &HashMap<String, SocketOwner>,
+    owners: &HashMap<u64, SocketOwner>,
 ) -> Option<NetRow> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 10 {
         return None;
     }
 
-    let inode = parts[9].to_string();
+    let inode: u64 = parts[9].parse().ok()?;
     let (tx_queue, rx_queue) = parse_queue(parts[4]).unwrap_or((0, 0));
 
     Some(NetRow {
@@ -110,7 +116,7 @@ fn parse_proc_net_line(
         tx_queue,
         rx_queue,
         owner: owners.get(&inode).cloned(),
-        inode,
+        socket_id: SocketId::Inode(inode),
     })
 }
 
@@ -158,7 +164,11 @@ fn parse_ipv6(value: &str) -> Option<std::net::Ipv6Addr> {
     let mut bytes = [0u8; 16];
     for word in 0..4 {
         let raw = u32::from_str_radix(&value[word * 8..word * 8 + 8], 16).ok()?;
-        let ordered = if cfg!(target_endian = "little") { raw.swap_bytes() } else { raw };
+        let ordered = if cfg!(target_endian = "little") {
+            raw.swap_bytes()
+        } else {
+            raw
+        };
         bytes[word * 4..word * 4 + 4].copy_from_slice(&ordered.to_be_bytes());
     }
     Some(std::net::Ipv6Addr::from(bytes))
@@ -188,17 +198,32 @@ mod tests {
     #[test]
     fn parses_ipv4_little_endian_proc_addr() {
         assert_eq!(parse_ipv4("0100007F").as_deref(), Some("127.0.0.1"));
-        assert_eq!(parse_addr_port("0100007F:1F90", false).as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(
+            parse_addr_port("0100007F:1F90", false).as_deref(),
+            Some("127.0.0.1:8080")
+        );
     }
 
     #[test]
     fn parses_ipv6_in_kernel_word_order() {
-        assert_eq!(parse_addr_port("00000000000000000000000001000000:0277", true).as_deref(), Some("[::1]:631"));
-        assert_eq!(parse_addr_port("00000000000000000000000000000000:0016", true).as_deref(), Some("[::]:22"));
+        assert_eq!(
+            parse_addr_port("00000000000000000000000001000000:0277", true).as_deref(),
+            Some("[::1]:631")
+        );
+        assert_eq!(
+            parse_addr_port("00000000000000000000000000000000:0016", true).as_deref(),
+            Some("[::]:22")
+        );
         // 2001:db8::1 as the kernel prints it
-        assert_eq!(parse_addr_port("B80D0120000000000000000001000000:01BB", true).as_deref(), Some("[2001:db8::1]:443"));
+        assert_eq!(
+            parse_addr_port("B80D0120000000000000000001000000:01BB", true).as_deref(),
+            Some("[2001:db8::1]:443")
+        );
         // IPv4-mapped 127.0.0.1
-        assert_eq!(parse_addr_port("0000000000000000FFFF00000100007F:1F90", true).as_deref(), Some("[::ffff:127.0.0.1]:8080"));
+        assert_eq!(
+            parse_addr_port("0000000000000000FFFF00000100007F:1F90", true).as_deref(),
+            Some("[::ffff:127.0.0.1]:8080")
+        );
         assert_eq!(parse_addr_port("zz:0016", true), None);
     }
 
@@ -206,7 +231,7 @@ mod tests {
     fn parses_proc_net_line() {
         let mut owners = HashMap::new();
         owners.insert(
-            "12345".to_string(),
+            12345,
             SocketOwner {
                 pid: 42,
                 process: "demo".to_string(),
@@ -224,5 +249,6 @@ mod tests {
         assert_eq!(row.local_addr, "127.0.0.1:8080");
         assert_eq!(row.state, "LISTEN");
         assert_eq!(row.owner_label(), "demo (42)");
+        assert_eq!(row.socket_id, SocketId::Inode(12345));
     }
 }

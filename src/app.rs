@@ -1,13 +1,20 @@
 use std::collections::HashMap;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText, TextEdit};
 
-use crate::capture::{read_connections, read_processes, socket_owners};
+use crate::capture::{self, CaptureSource, Platform, Snapshot};
 use crate::evidence::{self, EndpointClass, EvidenceInput};
 use crate::keyring::{self, Action as KeyringAction, Outcome as KeyringOutcome};
-use crate::model::{NetRow, ProcessRow};
+use crate::model::{NetRow, ProcessRow, SocketId};
 use crate::redaction::redact_with_terms;
+
+#[cfg(all(test, feature = "screenshots"))]
+mod screenshots;
+
+/// How often the polling thread captures a new snapshot.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlmProvider {
@@ -19,7 +26,12 @@ pub enum LlmProvider {
 
 impl LlmProvider {
     pub fn all() -> &'static [Self] {
-        &[Self::OpenRouter, Self::OpenAI, Self::Anthropic, Self::Ollama]
+        &[
+            Self::OpenRouter,
+            Self::OpenAI,
+            Self::Anthropic,
+            Self::Ollama,
+        ]
     }
 
     pub fn label(&self) -> &'static str {
@@ -69,12 +81,6 @@ pub enum NetFilterType {
     Udp,
 }
 
-pub struct ProcSnapshot {
-    pub processes: Vec<ProcessRow>,
-    pub connections: Vec<NetRow>,
-    pub status: String,
-}
-
 struct DnsRequest {
     ip: String,
     ctx: egui::Context,
@@ -90,17 +96,20 @@ pub struct VtLensApp {
     processes: Vec<ProcessRow>,
     connections: Vec<NetRow>,
     selected_pid: Option<u32>,
-    selected_network_inode: Option<String>,
+    selected_socket: Option<SocketId>,
     process_filter: String,
     network_filter: String,
     explain_prompt: String,
     export_preview: String,
     private_terms: String,
     status: String,
+    platform: Platform,
     demo_mode: bool,
     auto_refresh: bool,
-    tx_snapshot: std::sync::mpsc::Sender<ProcSnapshot>,
-    rx_snapshot: std::sync::mpsc::Receiver<ProcSnapshot>,
+    /// A manual refresh is applied even while auto refresh is paused.
+    refresh_requested: bool,
+    tx_refresh: std::sync::mpsc::Sender<()>,
+    rx_snapshot: std::sync::mpsc::Receiver<Snapshot>,
     // LLM Analysis Integration
     api_key: String,
     keyring_status: String,
@@ -131,7 +140,7 @@ pub struct VtLensApp {
 }
 
 impl VtLensApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, mut source: Box<dyn CaptureSource>) -> Self {
         let mut visuals = egui::Visuals::light();
 
         // Premium Light Mode styling (Tailwind CSS inspired palette)
@@ -140,8 +149,8 @@ impl VtLensApp {
         visuals.extreme_bg_color = egui::Color32::from_rgb(243, 244, 246); // Tailwind gray-100 (for grids/inputs)
         visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(255, 255, 255);
         visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(249, 250, 251); // Tailwind gray-50
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(243, 244, 246);  // Tailwind gray-100
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(229, 231, 235);   // Tailwind gray-200
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(243, 244, 246); // Tailwind gray-100
+        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(229, 231, 235); // Tailwind gray-200
 
         // Borders styling
         visuals.widgets.noninteractive.bg_stroke.color = egui::Color32::from_rgb(229, 231, 235); // faint gray borders
@@ -154,37 +163,56 @@ impl VtLensApp {
         visuals.selection.stroke.color = egui::Color32::from_rgb(255, 255, 255);
 
         // Rounded corners
-        visuals.widgets.noninteractive.rounding = egui::Rounding::same(6.0);
-        visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
-        visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
-        visuals.widgets.active.rounding = egui::Rounding::same(6.0);
-        visuals.window_rounding = egui::Rounding::same(8.0);
+        visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
+        visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+        visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+        visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
+        visuals.window_corner_radius = egui::CornerRadius::same(8);
 
-        cc.egui_ctx.set_visuals(visuals);
+        // The palette is light-only: pin the light theme so a dark OS theme
+        // (or a switch while running) does not swap in egui's dark visuals.
+        cc.egui_ctx.set_visuals_of(egui::Theme::Light, visuals);
+        cc.egui_ctx.set_theme(egui::ThemePreference::Light);
 
         let (tx_analysis, rx_analysis) = std::sync::mpsc::channel();
         let (tx_keyring, rx_keyring) = std::sync::mpsc::channel();
         let (tx_snapshot, rx_snapshot) = std::sync::mpsc::channel();
+        let (tx_refresh, rx_refresh) = std::sync::mpsc::channel::<()>();
 
-        // Spawn background polling thread loop
-        let tx_snapshot_clone = tx_snapshot.clone();
+        let platform = source.platform();
+        let demo_mode = source.is_demo();
+        // The first snapshot is taken here, so the first frame has data.
+        let first = source.capture();
+
+        // Polling thread: owns the capture backend, captures every
+        // POLL_INTERVAL or right away when the UI asks for a refresh.
         let ctx_clone = cc.egui_ctx.clone();
-        let demo_mode = std::env::args().any(|arg| arg == "--demo");
         std::thread::spawn(move || {
-            loop {
-                let snapshot = if demo_mode { demo_snapshot() } else { capture_system_snapshot() };
-                if tx_snapshot_clone.send(snapshot).is_err() {
+            // Stops when the app is gone (either channel disconnects).
+            while let Ok(()) | Err(RecvTimeoutError::Timeout) =
+                rx_refresh.recv_timeout(POLL_INTERVAL)
+            {
+                if tx_snapshot.send(source.capture()).is_err() {
                     break;
                 }
                 ctx_clone.request_repaint(); // immediately trigger repaint in the GUI thread
-                std::thread::sleep(Duration::from_secs(2));
             }
         });
 
         // Spawn background DNS resolver thread
         let (tx_dns, rx_dns) = std::sync::mpsc::channel::<DnsRequest>();
-        let dns_cache = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let dns_resolving = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        // Demo mode never looks anything up; it shows example.com names instead.
+        let seeded_names: HashMap<String, String> = if demo_mode {
+            capture::DEMO_HOSTNAMES
+                .iter()
+                .map(|(addr, name)| (addr.to_string(), name.to_string()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        let dns_cache = std::sync::Arc::new(std::sync::Mutex::new(seeded_names));
+        let dns_resolving =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
         let dns_cache_clone = dns_cache.clone();
         let dns_resolving_clone = dns_resolving.clone();
@@ -221,19 +249,21 @@ impl VtLensApp {
         });
 
         let mut app = Self {
-            processes: Vec::new(),
-            connections: Vec::new(),
+            processes: first.processes,
+            connections: first.connections,
             selected_pid: None,
-            selected_network_inode: None,
+            selected_socket: None,
             process_filter: String::new(),
             network_filter: String::new(),
             explain_prompt: String::new(),
             export_preview: String::new(),
             private_terms: String::new(),
-            status: "Starting capture".to_string(),
+            status: first.status,
+            platform,
             demo_mode,
             auto_refresh: true,
-            tx_snapshot,
+            refresh_requested: false,
+            tx_refresh,
             rx_snapshot,
             api_key: String::new(),
             keyring_status: String::new(),
@@ -262,10 +292,22 @@ impl VtLensApp {
         };
 
         app.update_caches();
-        if !app.demo_mode {
+        if app.keyring_enabled() {
             app.run_keyring_action(KeyringAction::Load, &cc.egui_ctx);
         }
         app
+    }
+
+    /// Demo mode never touches the OS keyring (safe screenshots), and macOS
+    /// has no `secret-tool`; there the key is pasted for the session only.
+    fn keyring_enabled(&self) -> bool {
+        !self.demo_mode && keyring::AVAILABLE
+    }
+
+    /// Ask the polling thread for a snapshot now.
+    fn request_refresh(&mut self) {
+        self.refresh_requested = true;
+        let _ = self.tx_refresh.send(());
     }
 
     fn run_keyring_action(&self, action: KeyringAction, ctx: &egui::Context) {
@@ -315,7 +357,7 @@ impl VtLensApp {
 
     fn reset_view(&mut self) {
         self.selected_pid = None;
-        self.selected_network_inode = None;
+        self.selected_socket = None;
         self.process_filter.clear();
         self.network_filter.clear();
         self.net_filter_type = NetFilterType::All;
@@ -324,13 +366,13 @@ impl VtLensApp {
 
     fn clear_selected_process(&mut self) {
         self.selected_pid = None;
-        self.selected_network_inode = None;
+        self.selected_socket = None;
         self.update_caches();
     }
 
     #[allow(dead_code)]
     fn clear_selected_connection(&mut self) {
-        self.selected_network_inode = None;
+        self.selected_socket = None;
         self.update_caches();
     }
 
@@ -341,13 +383,11 @@ impl VtLensApp {
         self.update_caches();
     }
 
-
-
     fn update_caches(&mut self) {
         // 1. Precalculate metrics (Processes, Sockets, External, Listening, UDP/Multicast counts)
         self.metric_processes_count = self.processes.len();
         self.metric_sockets_count = self.connections.len();
-        
+
         let mut ext_count = 0;
         let mut listen_count = 0;
         let mut udp_multi_count = 0;
@@ -372,7 +412,8 @@ impl VtLensApp {
         // 2. Filter processes cache
         let proc_filter = self.process_filter.trim().to_lowercase();
         let only_active = self.only_network_active;
-        let mut filtered_procs: Vec<ProcessRow> = self.processes
+        let mut filtered_procs: Vec<ProcessRow> = self
+            .processes
             .iter()
             .filter(|process| {
                 if only_active && process.socket_count == 0 {
@@ -388,7 +429,8 @@ impl VtLensApp {
 
         // Sort by socket count descending, then by name
         filtered_procs.sort_by(|a, b| {
-            b.socket_count.cmp(&a.socket_count)
+            b.socket_count
+                .cmp(&a.socket_count)
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
 
@@ -396,24 +438,29 @@ impl VtLensApp {
 
         // 3. Filter connections cache
         let net_filter = self.network_filter.trim().to_lowercase();
-        self.filtered_connections_cache = self.connections
+        self.filtered_connections_cache = self
+            .connections
             .iter()
             .filter(|connection| {
-                if let Some(selected_pid) = self.selected_pid {
-                    if connection.owner.as_ref().map(|owner| owner.pid) != Some(selected_pid) {
-                        return false;
-                    }
+                if let Some(selected_pid) = self.selected_pid
+                    && connection.owner.as_ref().map(|owner| owner.pid) != Some(selected_pid)
+                {
+                    return false;
                 }
 
                 match self.net_filter_type {
                     NetFilterType::All => {}
                     NetFilterType::External => {
-                        if Self::classify_endpoint(&connection.remote_addr) != EndpointClass::External {
+                        if Self::classify_endpoint(&connection.remote_addr)
+                            != EndpointClass::External
+                        {
                             return false;
                         }
                     }
                     NetFilterType::Localhost => {
-                        if Self::classify_endpoint(&connection.remote_addr) != EndpointClass::Localhost {
+                        if Self::classify_endpoint(&connection.remote_addr)
+                            != EndpointClass::Localhost
+                        {
                             return false;
                         }
                     }
@@ -439,21 +486,24 @@ impl VtLensApp {
                     || connection.local_addr.to_lowercase().contains(&net_filter)
                     || connection.remote_addr.to_lowercase().contains(&net_filter)
                     || connection.state.to_lowercase().contains(&net_filter)
-                    || connection.owner_label().to_lowercase().contains(&net_filter)
+                    || connection
+                        .owner_label()
+                        .to_lowercase()
+                        .contains(&net_filter)
             })
             .cloned()
             .collect();
 
         // 4. Validate selected connection matches selected process PID
-        if let Some(inode) = &self.selected_network_inode {
-            if let Some(connection) = self.connections.iter().find(|c| &c.inode == inode) {
-                if let Some(selected_pid) = self.selected_pid {
-                    if connection.owner.as_ref().map(|owner| owner.pid) != Some(selected_pid) {
-                        self.selected_network_inode = None;
-                    }
+        if let Some(id) = self.selected_socket {
+            if let Some(connection) = self.connections.iter().find(|c| c.socket_id == id) {
+                if let Some(selected_pid) = self.selected_pid
+                    && connection.owner.as_ref().map(|owner| owner.pid) != Some(selected_pid)
+                {
+                    self.selected_socket = None;
                 }
             } else {
-                self.selected_network_inode = None;
+                self.selected_socket = None;
             }
         }
     }
@@ -465,10 +515,11 @@ impl VtLensApp {
 
     fn evidence_input(&self) -> EvidenceInput<'_> {
         EvidenceInput {
+            platform: self.platform,
             processes: &self.processes,
             connections: &self.connections,
             selected_pid: self.selected_pid,
-            selected_inode: self.selected_network_inode.as_deref(),
+            selected_socket: self.selected_socket,
             sample: &self.filtered_connections_cache,
         }
     }
@@ -479,9 +530,17 @@ impl VtLensApp {
     }
 
     fn build_ai_prompt(&self) -> String {
-        let mut prompt = String::from(
-            "You are a Linux security educator and local system observability assistant.\n\n\
-             Explain the following local Linux process and socket evidence in plain Spanish for Argentina/LatAm.\n\n\
+        let os = self.platform.name();
+        let visibility = match self.platform {
+            Platform::Linux => "",
+            Platform::MacOs => {
+                "* Without root, lsof only lists sockets of the user's own processes; other users' and root's sockets are missing\n\
+                 * Without root, other users' processes report 0 MB, 0 threads and an unknown state: macOS hides those values, they are not real zeros\n"
+            }
+        };
+        let mut prompt = format!(
+            "You are a {os} security educator and local system observability assistant.\n\n\
+             Explain the following local {os} process and socket evidence in plain Spanish for Argentina/LatAm.\n\n\
              Rules:\n\
              * Be direct, practical, and technical.\n\
              * Do not invent facts.\n\
@@ -489,11 +548,12 @@ impl VtLensApp {
              * Treat the raw evidence as the source of truth.\n\
              * Explain what is likely happening, what looks normal, what deserves attention, and what the learner should verify manually.\n\
              * If evidence is incomplete, say what is missing.\n\
-             * Always suggest concrete Linux commands to verify the finding manually.\n\
+             * Always suggest concrete {os} commands to verify the finding manually.\n\
              * Keep the tone educational, not alarmist.\n\n\
              System context:\n\
-             * Capture source: /proc\n\
+             * Capture source: {source}\n\
              * No root privileges\n\
+             {visibility}\
              * Connection-level capture only\n\
              * No packet payload inspection\n\
              * No DNS ownership verification unless hostname is present\n\n\
@@ -503,11 +563,15 @@ impl VtLensApp {
              3. Qué parece normal\n\
              4. Qué merece atención\n\
              5. Cómo verificarlo manualmente\n\
-             6. Limitaciones de esta evidencia\n\n"
+             6. Limitaciones de esta evidencia\n\n",
+            source = self.platform.source_label(),
         );
 
         prompt.push_str("--- REDACTED EVIDENCE ---\n");
-        prompt.push_str(&redact_with_terms(&self.build_ai_evidence(), &self.private_terms));
+        prompt.push_str(&redact_with_terms(
+            &self.build_ai_evidence(),
+            &self.private_terms,
+        ));
         prompt
     }
 
@@ -521,29 +585,34 @@ impl VtLensApp {
         self.explain_prompt = self.build_prompt();
         self.export_preview = self.build_markdown_export();
         self.analysis_prepared = true;
-        self.analysis_result = "Vista previa lista en el inspector: revisala y usá \"2. Enviar a IA\".".to_string();
+        self.analysis_result =
+            "Vista previa lista en el inspector: revisala y usá \"2. Enviar a IA\".".to_string();
     }
 
     fn build_markdown_export(&self) -> String {
-        redact_with_terms(&evidence::build_markdown(&self.evidence_input(), &self.status), &self.private_terms)
+        redact_with_terms(
+            &evidence::build_markdown(&self.evidence_input(), &self.status),
+            &self.private_terms,
+        )
     }
 
     fn show_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("VT LENS").strong().size(15.0));
-                ui.label(RichText::new(if self.demo_mode { "DEMO · datos sintéticos · sin captura del equipo" } else { "Local system visibility · no root · /proc based" }).weak().size(10.0));
+                let subtitle = if self.demo_mode {
+                    "DEMO · datos sintéticos · sin captura del equipo".to_string()
+                } else {
+                    format!(
+                        "Local system visibility · no root · {} based",
+                        self.platform.source_label()
+                    )
+                };
+                ui.label(RichText::new(subtitle).weak().size(10.0));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("⟳ Refresh").clicked() {
-                    let tx = self.tx_snapshot.clone();
-                    let ctx = ui.ctx().clone();
-                    let demo_mode = self.demo_mode;
-                    std::thread::spawn(move || {
-                        let snapshot = if demo_mode { demo_snapshot() } else { capture_system_snapshot() };
-                        let _ = tx.send(snapshot);
-                        ctx.request_repaint();
-                    });
+                    self.request_refresh();
                 }
                 ui.checkbox(&mut self.auto_refresh, "Auto refresh");
             });
@@ -557,13 +626,22 @@ impl VtLensApp {
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("PROCESOS").strong().size(10.0).color(ui.visuals().weak_text_color()));
+            ui.label(
+                RichText::new("PROCESOS")
+                    .strong()
+                    .size(10.0)
+                    .color(ui.visuals().weak_text_color()),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.checkbox(&mut self.only_network_active, "Solo activos 🌐");
             });
         });
         ui.add_space(4.0);
-        ui.add(TextEdit::singleline(&mut self.process_filter).hint_text("🔍 filter pid, name...").desired_width(f32::INFINITY));
+        ui.add(
+            TextEdit::singleline(&mut self.process_filter)
+                .hint_text("🔍 filter pid, name...")
+                .desired_width(f32::INFINITY),
+        );
         ui.add_space(8.0);
 
         let total_rows = self.filtered_processes_cache.len();
@@ -583,40 +661,62 @@ impl VtLensApp {
                     egui::Color32::from_rgb(255, 255, 255)
                 };
 
-                let ext_count = self.connections.iter().filter(|c| {
-                    c.owner.as_ref().map(|o| o.pid) == Some(process_pid) 
-                        && Self::classify_endpoint(&c.remote_addr) == EndpointClass::External
-                }).count();
+                let ext_count = self
+                    .connections
+                    .iter()
+                    .filter(|c| {
+                        c.owner.as_ref().map(|o| o.pid) == Some(process_pid)
+                            && Self::classify_endpoint(&c.remote_addr) == EndpointClass::External
+                    })
+                    .count();
 
-                let response = egui::Frame::none()
+                let response = egui::Frame::NONE
                     .fill(card_color)
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)))
-                    .rounding(6.0)
-                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(229, 231, 235),
+                    ))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(&process_name).strong().size(12.0));
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if selected {
-                                        if ui.small_button("×").clicked() {
-                                            self.clear_selected_process();
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if selected {
+                                            if ui.small_button("×").clicked() {
+                                                self.clear_selected_process();
+                                            }
+                                        } else if process_socket_count > 0 {
+                                            let label_text = if ext_count > 0 {
+                                                format!(
+                                                    "{} 🌐 ({} ext)",
+                                                    process_socket_count, ext_count
+                                                )
+                                            } else {
+                                                format!("{} 🌐", process_socket_count)
+                                            };
+                                            ui.label(RichText::new(label_text).weak().size(9.0));
                                         }
-                                    } else if process_socket_count > 0 {
-                                        let label_text = if ext_count > 0 {
-                                            format!("{} 🌐 ({} ext)", process_socket_count, ext_count)
-                                        } else {
-                                            format!("{} 🌐", process_socket_count)
-                                        };
-                                        ui.label(RichText::new(label_text).weak().size(9.0));
-                                    }
-                                });
+                                    },
+                                );
                             });
                             ui.add_space(2.0);
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(format!("PID {}", process_pid)).weak().monospace().size(10.0));
+                                ui.label(
+                                    RichText::new(format!("PID {}", process_pid))
+                                        .weak()
+                                        .monospace()
+                                        .size(10.0),
+                                );
                                 ui.separator();
-                                ui.label(RichText::new(format!("{:.1} MB", process_rss_mb)).weak().size(10.0));
+                                ui.label(
+                                    RichText::new(format!("{:.1} MB", process_rss_mb))
+                                        .weak()
+                                        .size(10.0),
+                                );
                             });
                         });
                     });
@@ -627,7 +727,7 @@ impl VtLensApp {
                         self.clear_selected_process();
                     } else {
                         self.selected_pid = Some(process_pid);
-                        self.selected_network_inode = None;
+                        self.selected_socket = None;
                         self.network_filter.clear();
                     }
                 }
@@ -637,27 +737,52 @@ impl VtLensApp {
     }
 
     fn render_active_context_banner(&mut self, ui: &mut egui::Ui) {
-        let selected_info = self.selected_process().map(|p| (p.name.clone(), p.pid, p.socket_count));
+        let selected_info = self
+            .selected_process()
+            .map(|p| (p.name.clone(), p.pid, p.socket_count));
         let width = ui.available_width();
-        
-        egui::Frame::none()
+
+        egui::Frame::NONE
             .fill(egui::Color32::from_rgb(255, 255, 255))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)))
-            .rounding(8.0)
-            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgb(229, 231, 235),
+            ))
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::symmetric(14, 10))
             .show(ui, |ui| {
                 if width < 520.0 {
                     ui.vertical(|ui| {
                         ui.vertical(|ui| {
                             if let Some((name, pid, socket_count)) = &selected_info {
-                                ui.label(RichText::new(format!("🕵️ Investigando: {}", name)).strong().size(13.0));
-                                ui.label(RichText::new(format!("PID {} · {} sockets", pid, socket_count)).weak().size(10.0));
+                                ui.label(
+                                    RichText::new(format!("🕵️ Investigando: {}", name))
+                                        .strong()
+                                        .size(13.0),
+                                );
+                                ui.label(
+                                    RichText::new(format!(
+                                        "PID {} · {} sockets",
+                                        pid, socket_count
+                                    ))
+                                    .weak()
+                                    .size(10.0),
+                                );
                             } else {
-                                ui.label(RichText::new("🌐 Todas las conexiones").strong().size(13.0));
-                                ui.label(RichText::new("Mostrando sockets activos desde /proc").weak().size(10.0));
+                                ui.label(
+                                    RichText::new("🌐 Todas las conexiones").strong().size(13.0),
+                                );
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Mostrando sockets activos desde {}",
+                                        self.platform.source_label()
+                                    ))
+                                    .weak()
+                                    .size(10.0),
+                                );
                             }
                         });
-                        
+
                         if selected_info.is_some() {
                             ui.add_space(6.0);
                             ui.horizontal_wrapped(|ui| {
@@ -677,14 +802,34 @@ impl VtLensApp {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             if let Some((name, pid, socket_count)) = &selected_info {
-                                ui.label(RichText::new(format!("🕵️ Investigando: {}", name)).strong().size(13.0));
-                                ui.label(RichText::new(format!("PID {} · {} sockets detectados", pid, socket_count)).weak().size(10.0));
+                                ui.label(
+                                    RichText::new(format!("🕵️ Investigando: {}", name))
+                                        .strong()
+                                        .size(13.0),
+                                );
+                                ui.label(
+                                    RichText::new(format!(
+                                        "PID {} · {} sockets detectados",
+                                        pid, socket_count
+                                    ))
+                                    .weak()
+                                    .size(10.0),
+                                );
                             } else {
-                                ui.label(RichText::new("🌐 Todas las conexiones").strong().size(13.0));
-                                ui.label(RichText::new("Mostrando sockets activos capturados desde /proc").weak().size(10.0));
+                                ui.label(
+                                    RichText::new("🌐 Todas las conexiones").strong().size(13.0),
+                                );
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Mostrando sockets activos capturados desde {}",
+                                        self.platform.source_label()
+                                    ))
+                                    .weak()
+                                    .size(10.0),
+                                );
                             }
                         });
-                        
+
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if selected_info.is_some() {
                                 if ui.button("Ver todas las conexiones").clicked() {
@@ -705,24 +850,36 @@ impl VtLensApp {
 
     fn render_filter_chips(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
-        let has_filters = self.selected_pid.is_some() 
-            || self.net_filter_type != NetFilterType::All 
+        let has_filters = self.selected_pid.is_some()
+            || self.net_filter_type != NetFilterType::All
             || !self.network_filter.trim().is_empty();
-            
+
         if has_filters {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Filtros activos:").weak().size(10.0));
-                
+
                 if let Some(pid) = self.selected_pid {
-                    let proc_name = self.processes.iter().find(|p| p.pid == pid).map(|p| p.name.as_str()).unwrap_or("Proceso");
-                    let chip_text = format!("Proceso: {} ({}) ✕", proc_name, pid);
-                    if ui.button(RichText::new(chip_text).size(10.0).color(egui::Color32::from_rgb(180, 83, 9))).clicked() {
+                    let proc_name = self
+                        .processes
+                        .iter()
+                        .find(|p| p.pid == pid)
+                        .map(|p| p.name.as_str())
+                        .unwrap_or("Proceso");
+                    let chip_text = format!("Proceso: {} ({}) ×", proc_name, pid);
+                    if ui
+                        .button(
+                            RichText::new(chip_text)
+                                .size(10.0)
+                                .color(egui::Color32::from_rgb(180, 83, 9)),
+                        )
+                        .clicked()
+                    {
                         self.selected_pid = None;
-                        self.selected_network_inode = None;
+                        self.selected_socket = None;
                         changed = true;
                     }
                 }
-                
+
                 if self.net_filter_type != NetFilterType::All {
                     let type_str = match self.net_filter_type {
                         NetFilterType::External => "Externas",
@@ -732,24 +889,46 @@ impl VtLensApp {
                         NetFilterType::Udp => "UDP",
                         NetFilterType::All => "",
                     };
-                    let chip_text = format!("Tipo: {} ✕", type_str);
-                    if ui.button(RichText::new(chip_text).size(10.0).color(egui::Color32::from_rgb(180, 83, 9))).clicked() {
+                    let chip_text = format!("Tipo: {} ×", type_str);
+                    if ui
+                        .button(
+                            RichText::new(chip_text)
+                                .size(10.0)
+                                .color(egui::Color32::from_rgb(180, 83, 9)),
+                        )
+                        .clicked()
+                    {
                         self.net_filter_type = NetFilterType::All;
                         changed = true;
                     }
                 }
-                
+
                 if !self.network_filter.trim().is_empty() {
-                    let chip_text = format!("Búsqueda: \"{}\" ✕", self.network_filter.trim());
-                    if ui.button(RichText::new(chip_text).size(10.0).color(egui::Color32::from_rgb(180, 83, 9))).clicked() {
+                    let chip_text = format!("Búsqueda: \"{}\" ×", self.network_filter.trim());
+                    if ui
+                        .button(
+                            RichText::new(chip_text)
+                                .size(10.0)
+                                .color(egui::Color32::from_rgb(180, 83, 9)),
+                        )
+                        .clicked()
+                    {
                         self.network_filter.clear();
                         changed = true;
                     }
                 }
-                
+
                 ui.separator();
-                
-                if ui.button(RichText::new("Resetear vista").strong().size(10.0).color(egui::Color32::from_rgb(220, 38, 38))).clicked() {
+
+                if ui
+                    .button(
+                        RichText::new("Resetear vista")
+                            .strong()
+                            .size(10.0)
+                            .color(egui::Color32::from_rgb(220, 38, 38)),
+                    )
+                    .clicked()
+                {
                     self.reset_view();
                     changed = true;
                 }
@@ -760,10 +939,19 @@ impl VtLensApp {
     }
 
     fn render_empty_state(&mut self, ui: &mut egui::Ui) {
-        let pid_str = self.selected_pid.map(|p| p.to_string()).unwrap_or_else(|| "Ninguno".to_string());
-        let reported_sockets = self.selected_process().map(|p| p.socket_count.to_string()).unwrap_or_else(|| "0".to_string());
+        let pid_str = self
+            .selected_pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "Ninguno".to_string());
+        let reported_sockets = self
+            .selected_process()
+            .map(|p| p.socket_count.to_string())
+            .unwrap_or_else(|| "0".to_string());
         let pid_connections_count = if let Some(pid) = self.selected_pid {
-            self.connections.iter().filter(|c| c.owner.as_ref().map(|o| o.pid) == Some(pid)).count()
+            self.connections
+                .iter()
+                .filter(|c| c.owner.as_ref().map(|o| o.pid) == Some(pid))
+                .count()
         } else {
             self.connections.len()
         };
@@ -775,10 +963,10 @@ impl VtLensApp {
             ui.add_space(4.0);
             ui.label(RichText::new("Esto puede deberse a que el proceso cerró sus conexiones, el snapshot cambió o un filtro activo las está ocultando.").weak().size(11.0));
             ui.add_space(12.0);
-            
-            egui::Frame::none()
+
+            egui::Frame::NONE
                 .fill(egui::Color32::from_rgb(243, 244, 246))
-                .rounding(6.0)
+                .corner_radius(6.0)
                 .inner_margin(12.0)
                 .show(ui, |ui| {
                     ui.set_max_width(400.0);
@@ -789,7 +977,7 @@ impl VtLensApp {
                         ui.label(RichText::new(format!("• Conexiones visibles después de filtros: {}", visible_count)).monospace().size(10.0));
                     });
                 });
-                
+
             ui.add_space(14.0);
             ui.horizontal(|ui| {
                 if ui.button("🌐 Ver todas las conexiones").clicked() {
@@ -799,14 +987,7 @@ impl VtLensApp {
                     self.clear_all_filters();
                 }
                 if ui.button("⟳ Refrescar ahora").clicked() {
-                    let tx = self.tx_snapshot.clone();
-                    let ctx = ui.ctx().clone();
-                    let demo_mode = self.demo_mode;
-                    std::thread::spawn(move || {
-                        let snapshot = if demo_mode { demo_snapshot() } else { capture_system_snapshot() };
-                        let _ = tx.send(snapshot);
-                        ctx.request_repaint();
-                    });
+                    self.request_refresh();
                 }
             });
         });
@@ -827,20 +1008,28 @@ impl VtLensApp {
             ("Escuchando", listening_count.to_string()),
             ("UDP/Multi", udp_multicast_count.to_string()),
         ];
-        
+
         let available_w = ui.available_width();
         if available_w < 520.0 {
             ui.horizontal_wrapped(|ui| {
                 for (label, val) in metrics.iter() {
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(255, 255, 255))
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)))
-                        .rounding(6.0)
-                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(229, 231, 235),
+                        ))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::symmetric(10, 6))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(format!("{}:", label)).weak().size(9.0));
-                                ui.label(RichText::new(val.as_str()).strong().size(11.0).color(ui.visuals().selection.bg_fill));
+                                ui.label(
+                                    RichText::new(val.as_str())
+                                        .strong()
+                                        .size(11.0)
+                                        .color(ui.visuals().selection.bg_fill),
+                                );
                             });
                         });
                 }
@@ -848,15 +1037,23 @@ impl VtLensApp {
         } else {
             ui.columns(5, |columns| {
                 for (i, (label, val)) in metrics.iter().enumerate() {
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(255, 255, 255))
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)))
-                        .rounding(6.0)
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(229, 231, 235),
+                        ))
+                        .corner_radius(6.0)
                         .inner_margin(8.0)
                         .show(&mut columns[i], |ui| {
                             ui.vertical_centered(|ui| {
                                 ui.label(RichText::new(*label).weak().size(9.0));
-                                ui.label(RichText::new(val.as_str()).strong().size(16.0).color(ui.visuals().selection.bg_fill));
+                                ui.label(
+                                    RichText::new(val.as_str())
+                                        .strong()
+                                        .size(16.0)
+                                        .color(ui.visuals().selection.bg_fill),
+                                );
                             });
                         });
                 }
@@ -871,23 +1068,44 @@ impl VtLensApp {
 
         // 3. Filter chips row & filter choices
         ui.horizontal(|ui| {
-            ui.label(RichText::new("FILTROS:").strong().size(9.0).color(ui.visuals().weak_text_color()));
+            ui.label(
+                RichText::new("FILTROS:")
+                    .strong()
+                    .size(9.0)
+                    .color(ui.visuals().weak_text_color()),
+            );
             ui.selectable_value(&mut self.net_filter_type, NetFilterType::All, "Todos");
-            ui.selectable_value(&mut self.net_filter_type, NetFilterType::External, "🌐 Externas");
-            ui.selectable_value(&mut self.net_filter_type, NetFilterType::Localhost, "🏠 Localhost");
-            ui.selectable_value(&mut self.net_filter_type, NetFilterType::Listening, "👂 Escuchando");
+            ui.selectable_value(
+                &mut self.net_filter_type,
+                NetFilterType::External,
+                "🌐 Externas",
+            );
+            ui.selectable_value(
+                &mut self.net_filter_type,
+                NetFilterType::Localhost,
+                "🏠 Localhost",
+            );
+            ui.selectable_value(
+                &mut self.net_filter_type,
+                NetFilterType::Listening,
+                "👂 Escuchando",
+            );
             ui.selectable_value(&mut self.net_filter_type, NetFilterType::Tcp, "TCP");
             ui.selectable_value(&mut self.net_filter_type, NetFilterType::Udp, "UDP");
         });
 
         ui.add_space(6.0);
-        
+
         let chip_changed = self.render_filter_chips(ui);
         if chip_changed {
             self.update_caches();
         }
 
-        ui.add(TextEdit::singleline(&mut self.network_filter).hint_text("🔍 filter proto, addr, state, owner...").desired_width(f32::INFINITY));
+        ui.add(
+            TextEdit::singleline(&mut self.network_filter)
+                .hint_text("🔍 filter proto, addr, state, owner...")
+                .desired_width(f32::INFINITY),
+        );
         ui.add_space(8.0);
 
         // 4. Grid Table or Empty State
@@ -897,130 +1115,213 @@ impl VtLensApp {
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                egui::Grid::new("network_grid")
-                    .striped(true)
-                    .min_col_width(70.0)
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("Proto").weak().size(11.0));
-                        ui.label(RichText::new("Proceso dueño").weak().size(11.0));
-                        ui.label(RichText::new("Local").weak().size(11.0));
-                        ui.label(RichText::new("Remoto").weak().size(11.0));
-                        ui.label(RichText::new("Estado").weak().size(11.0));
-                        ui.end_row();
+                    egui::Grid::new("network_grid")
+                        .striped(true)
+                        .min_col_width(70.0)
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Proto").weak().size(11.0));
+                            ui.label(RichText::new("Proceso dueño").weak().size(11.0));
+                            ui.label(RichText::new("Local").weak().size(11.0));
+                            ui.label(RichText::new("Remoto").weak().size(11.0));
+                            ui.label(RichText::new("Estado").weak().size(11.0));
+                            ui.end_row();
 
-                        for connection in self.filtered_connections_cache.iter().take(500) {
-                            let selected = self.selected_network_inode.as_ref() == Some(&connection.inode);
-                            let mut clicked = false;
+                            for connection in self.filtered_connections_cache.iter().take(500) {
+                                let selected = self.selected_socket == Some(connection.socket_id);
+                                let mut clicked = false;
 
-                            // Protocol chip cell
-                            ui.horizontal(|ui| {
-                                let (bg, fg) = if connection.protocol.starts_with("tcp") {
-                                    (egui::Color32::from_rgb(224, 242, 254), egui::Color32::from_rgb(3, 105, 161))
-                                } else {
-                                    (egui::Color32::from_rgb(243, 244, 246), egui::Color32::from_rgb(55, 65, 81))
-                                };
-                                let resp = egui::Frame::none()
-                                    .fill(bg)
-                                    .rounding(3.0)
-                                    .inner_margin(egui::Margin::symmetric(6.0, 2.0))
-                                    .show(ui, |ui| {
-                                        ui.label(RichText::new(connection.protocol.to_uppercase()).strong().size(9.0).color(fg));
-                                    });
-                                let r = resp.response.interact(egui::Sense::click());
-                                if r.clicked() || r.double_clicked() { clicked = true; }
-                            });
+                                // Protocol chip cell
+                                ui.horizontal(|ui| {
+                                    let (bg, fg) = if connection.protocol.starts_with("tcp") {
+                                        (
+                                            egui::Color32::from_rgb(224, 242, 254),
+                                            egui::Color32::from_rgb(3, 105, 161),
+                                        )
+                                    } else {
+                                        (
+                                            egui::Color32::from_rgb(243, 244, 246),
+                                            egui::Color32::from_rgb(55, 65, 81),
+                                        )
+                                    };
+                                    let resp = egui::Frame::NONE
+                                        .fill(bg)
+                                        .corner_radius(3.0)
+                                        .inner_margin(egui::Margin::symmetric(6, 2))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                RichText::new(connection.protocol.to_uppercase())
+                                                    .strong()
+                                                    .size(9.0)
+                                                    .color(fg),
+                                            );
+                                        });
+                                    let r = resp.response.interact(egui::Sense::click());
+                                    if r.clicked() || r.double_clicked() {
+                                        clicked = true;
+                                    }
+                                });
 
-                            // Process cell
-                            let owner_label = connection.owner_label();
-                            let r_owner = ui.selectable_label(selected, &owner_label);
-                            if r_owner.clicked() || r_owner.double_clicked() { clicked = true; }
+                                // Process cell
+                                let owner_label = connection.owner_label();
+                                let r_owner = ui.selectable_label(selected, &owner_label);
+                                if r_owner.clicked() || r_owner.double_clicked() {
+                                    clicked = true;
+                                }
 
-                            // Local Addr cell
-                            let r_local = ui.selectable_label(selected, RichText::new(&connection.local_addr).monospace().size(11.0));
-                            if r_local.clicked() || r_local.double_clicked() { clicked = true; }
+                                // Local Addr cell
+                                let r_local = ui.selectable_label(
+                                    selected,
+                                    RichText::new(&connection.local_addr).monospace().size(11.0),
+                                );
+                                if r_local.clicked() || r_local.double_clicked() {
+                                    clicked = true;
+                                }
 
-                            // Remote Addr cell with external/localhost highlighting and DNS resolution
-                            let remote_class = Self::classify_endpoint(&connection.remote_addr);
-                            let resolved_addr = if let Ok(cache) = self.dns_cache.lock() {
-                                cache.get(&connection.remote_addr).cloned().unwrap_or_else(|| {
-                                    // Demo mode shows synthetic documentation IPs; never look them up.
-                                    if !self.demo_mode && (remote_class == EndpointClass::External || remote_class == EndpointClass::PrivateLan) {
-                                        if let Ok(mut resolving) = self.dns_resolving.lock() {
-                                            if resolving.insert(connection.remote_addr.clone()) {
+                                // Remote Addr cell with external/localhost highlighting and DNS resolution
+                                let remote_class = Self::classify_endpoint(&connection.remote_addr);
+                                let resolved_addr = if let Ok(cache) = self.dns_cache.lock() {
+                                    cache.get(&connection.remote_addr).cloned().unwrap_or_else(
+                                        || {
+                                            // Demo mode shows synthetic documentation IPs; never look them up.
+                                            if !self.demo_mode
+                                                && (remote_class == EndpointClass::External
+                                                    || remote_class == EndpointClass::PrivateLan)
+                                                && let Ok(mut resolving) = self.dns_resolving.lock()
+                                                && resolving.insert(connection.remote_addr.clone())
+                                            {
                                                 let _ = self.tx_dns.send(DnsRequest {
                                                     ip: connection.remote_addr.clone(),
                                                     ctx: ui.ctx().clone(),
                                                 });
                                             }
+                                            connection.remote_addr.clone()
+                                        },
+                                    )
+                                } else {
+                                    connection.remote_addr.clone()
+                                };
+
+                                let remote_text = match remote_class {
+                                    EndpointClass::Localhost => {
+                                        RichText::new(&resolved_addr).weak().monospace().size(11.0)
+                                    }
+                                    EndpointClass::Multicast => {
+                                        RichText::new(format!("{} 📢", resolved_addr))
+                                            .weak()
+                                            .monospace()
+                                            .size(11.0)
+                                    }
+                                    EndpointClass::PrivateLan => {
+                                        RichText::new(format!("{} 🏠", resolved_addr))
+                                            .weak()
+                                            .monospace()
+                                            .size(11.0)
+                                    }
+                                    EndpointClass::External => {
+                                        // Sky-blue text would vanish on the
+                                        // sky-blue selection highlight.
+                                        let color = if selected {
+                                            egui::Color32::WHITE
+                                        } else {
+                                            egui::Color32::from_rgb(14, 165, 233)
+                                        };
+                                        RichText::new(format!("{} 🌐", resolved_addr))
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(color)
+                                    }
+                                    _ => RichText::new(&resolved_addr).monospace().size(11.0),
+                                };
+                                let r_remote = ui.selectable_label(selected, remote_text);
+                                if r_remote.clicked() || r_remote.double_clicked() {
+                                    clicked = true;
+                                }
+
+                                // State cell
+                                ui.horizontal(|ui| {
+                                    let (bg, fg) = match connection.state.as_str() {
+                                        "ESTABLISHED" => (
+                                            egui::Color32::from_rgb(220, 252, 231),
+                                            egui::Color32::from_rgb(22, 101, 52),
+                                        ),
+                                        "LISTEN" => (
+                                            egui::Color32::from_rgb(254, 243, 199),
+                                            egui::Color32::from_rgb(146, 64, 14),
+                                        ),
+                                        _ => (
+                                            egui::Color32::from_rgb(243, 244, 246),
+                                            egui::Color32::from_rgb(75, 85, 99),
+                                        ),
+                                    };
+                                    let resp = egui::Frame::NONE
+                                        .fill(bg)
+                                        .corner_radius(3.0)
+                                        .inner_margin(egui::Margin::symmetric(6, 2))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                RichText::new(&connection.state)
+                                                    .strong()
+                                                    .size(9.0)
+                                                    .color(fg),
+                                            );
+                                        });
+                                    let r = resp.response.interact(egui::Sense::click());
+                                    if r.clicked() || r.double_clicked() {
+                                        clicked = true;
+                                    }
+                                });
+
+                                if clicked {
+                                    if selected {
+                                        self.selected_socket = None;
+                                    } else {
+                                        self.selected_socket = Some(connection.socket_id);
+                                        if let Some(ref owner) = connection.owner {
+                                            self.selected_pid = Some(owner.pid);
                                         }
                                     }
-                                    connection.remote_addr.clone()
-                                })
-                            } else {
-                                connection.remote_addr.clone()
-                            };
-
-                            let remote_text = match remote_class {
-                                EndpointClass::Localhost => RichText::new(&resolved_addr).weak().monospace().size(11.0),
-                                EndpointClass::Multicast => RichText::new(format!("{} 📢", resolved_addr)).weak().monospace().size(11.0),
-                                EndpointClass::PrivateLan => RichText::new(format!("{} 🏠", resolved_addr)).weak().monospace().size(11.0),
-                                EndpointClass::External => RichText::new(format!("{} 🌐", resolved_addr)).monospace().size(11.0).color(egui::Color32::from_rgb(14, 165, 233)),
-                                _ => RichText::new(&resolved_addr).monospace().size(11.0),
-                            };
-                            let r_remote = ui.selectable_label(selected, remote_text);
-                            if r_remote.clicked() || r_remote.double_clicked() { clicked = true; }
-
-                            // State cell
-                            ui.horizontal(|ui| {
-                                let (bg, fg) = match connection.state.as_str() {
-                                    "ESTABLISHED" => (egui::Color32::from_rgb(220, 252, 231), egui::Color32::from_rgb(22, 101, 52)),
-                                    "LISTEN" => (egui::Color32::from_rgb(254, 243, 199), egui::Color32::from_rgb(146, 64, 14)),
-                                    _ => (egui::Color32::from_rgb(243, 244, 246), egui::Color32::from_rgb(75, 85, 99)),
-                                };
-                                let resp = egui::Frame::none()
-                                    .fill(bg)
-                                    .rounding(3.0)
-                                    .inner_margin(egui::Margin::symmetric(6.0, 2.0))
-                                    .show(ui, |ui| {
-                                        ui.label(RichText::new(&connection.state).strong().size(9.0).color(fg));
-                                    });
-                                let r = resp.response.interact(egui::Sense::click());
-                                if r.clicked() || r.double_clicked() { clicked = true; }
-                            });
-
-                            if clicked {
-                                if selected {
-                                    self.selected_network_inode = None;
-                                } else {
-                                    self.selected_network_inode = Some(connection.inode.clone());
-                                    if let Some(ref owner) = connection.owner {
-                                        self.selected_pid = Some(owner.pid);
-                                    }
                                 }
+                                ui.end_row();
                             }
-                            ui.end_row();
-                        }
-                    });
-            });
+                        });
+                });
+        }
+    }
+
+    fn ui_commands(ui: &mut egui::Ui, commands: &[String]) {
+        for (index, command) in commands.iter().enumerate() {
+            if index > 0 {
+                ui.add_space(4.0);
+            }
+            Self::ui_copyable_command(ui, command);
         }
     }
 
     fn ui_copyable_command(ui: &mut egui::Ui, command: &str) {
         ui.horizontal_wrapped(|ui| {
-            if ui.small_button("📋").on_hover_text("Copiar al portapapeles").clicked() {
-                ui.output_mut(|o| o.copied_text = command.to_string());
+            if ui
+                .small_button("📋")
+                .on_hover_text("Copiar al portapapeles")
+                .clicked()
+            {
+                ui.ctx().copy_text(command.to_string());
             }
-            ui.add(egui::Label::new(RichText::new(command).monospace().size(10.0)).wrap(true));
+            ui.add(egui::Label::new(RichText::new(command).monospace().size(10.0)).wrap());
         });
     }
 
     fn render_inspector_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("INSPECTOR DETALLADO").strong().size(10.0).color(ui.visuals().weak_text_color()));
+            ui.label(
+                RichText::new("INSPECTOR DETALLADO")
+                    .strong()
+                    .size(10.0)
+                    .color(ui.visuals().weak_text_color()),
+            );
             ui.add_space(4.0);
-            if ui.button("✕").on_hover_text("Limpiar selección").clicked() {
+            if ui.button("×").on_hover_text("Limpiar selección").clicked() {
                 self.selected_pid = None;
-                self.selected_network_inode = None;
+                self.selected_socket = None;
             }
         });
         ui.add_space(8.0);
@@ -1030,40 +1331,40 @@ impl VtLensApp {
 
         // Resolve connection owner if a socket is selected but no process selected
         let mut selected_conn = None;
-        if let Some(inode) = &self.selected_network_inode {
-            if let Some(connection) = self.connections.iter().find(|c| &c.inode == inode) {
-                selected_conn = Some(connection.clone());
-                if focused_pid.is_none() {
-                    if let Some(owner) = &connection.owner {
-                        focused_pid = Some(owner.pid);
-                        focused_process = self.processes.iter().find(|p| p.pid == owner.pid).cloned();
-                    }
-                }
+        if let Some(id) = self.selected_socket
+            && let Some(connection) = self.connections.iter().find(|c| c.socket_id == id)
+        {
+            selected_conn = Some(connection.clone());
+            if focused_pid.is_none()
+                && let Some(owner) = &connection.owner
+            {
+                focused_pid = Some(owner.pid);
+                focused_process = self.processes.iter().find(|p| p.pid == owner.pid).cloned();
             }
         }
 
         egui::ScrollArea::vertical()
-            .id_source("inspector_scroll_area")
+            .id_salt("inspector_scroll_area")
             .show(ui, |ui| {
                 // STATE B: Connection Selected
                 if let Some(conn) = &selected_conn {
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(255, 255, 255))
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)))
-                        .rounding(6.0)
+                        .corner_radius(6.0)
                         .inner_margin(12.0)
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
                                 ui.label(RichText::new("CONEXIÓN SELECCIONADA").strong().size(9.0).color(egui::Color32::from_rgb(14, 165, 233)));
                                 ui.add_space(4.0);
-                                
+
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(conn.protocol.to_uppercase()).strong().size(12.0));
                                     ui.separator();
                                     ui.label(RichText::new(&conn.state).strong().size(11.0));
                                 });
                                 ui.add_space(6.0);
-                                
+
                                 ui.label(RichText::new("Local:").weak().size(9.0));
                                 ui.label(RichText::new(&conn.local_addr).monospace().size(11.0));
                                 ui.add_space(2.0);
@@ -1073,7 +1374,7 @@ impl VtLensApp {
                                 } else {
                                     None
                                 };
-                                
+
                                 if let Some(dns) = resolved {
                                     if dns != conn.remote_addr {
                                         ui.label(RichText::new(format!("{} ({})", dns, conn.remote_addr)).monospace().size(11.0));
@@ -1084,7 +1385,7 @@ impl VtLensApp {
                                     ui.label(RichText::new(&conn.remote_addr).monospace().size(11.0));
                                 }
                                 ui.add_space(4.0);
-                                
+
                                 let class = Self::classify_endpoint(&conn.remote_addr);
                                 let class_label = match class {
                                     EndpointClass::Localhost => "Localhost (Tráfico local interno)",
@@ -1095,8 +1396,8 @@ impl VtLensApp {
                                     EndpointClass::Unknown => "Desconocido",
                                 };
                                 ui.label(RichText::new(format!("Clasificación: {}", class_label)).size(10.0));
-                                ui.label(RichText::new(format!("Inode: {}", conn.inode)).weak().monospace().size(10.0));
-                                
+                                ui.label(RichText::new(socket_id_label(conn.socket_id)).weak().monospace().size(10.0));
+
                                 if let Some(owner) = &conn.owner {
                                     ui.add_space(4.0);
                                     ui.label(RichText::new(format!("Proceso dueño: {} (PID {})", owner.process, owner.pid)).size(10.0));
@@ -1109,20 +1410,14 @@ impl VtLensApp {
                     if let Some(pid) = focused_pid {
                         ui.label(RichText::new("VERIFICACIÓN MANUAL").strong().size(10.0).color(ui.visuals().weak_text_color()));
                         ui.add_space(2.0);
-                        egui::Frame::none()
+                        egui::Frame::NONE
                             .fill(egui::Color32::from_rgb(249, 250, 251))
                             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)))
-                            .rounding(6.0)
+                            .corner_radius(6.0)
                             .inner_margin(8.0)
                             .show(ui, |ui| {
                                 ui.vertical(|ui| {
-                                    Self::ui_copyable_command(ui, &format!("ss -tunap | grep {}", pid));
-                                    ui.add_space(4.0);
-                                    Self::ui_copyable_command(ui, &format!("lsof -p {} -i", pid));
-                                    ui.add_space(4.0);
-                                    Self::ui_copyable_command(ui, &format!("ps -fp {}", pid));
-                                    ui.add_space(4.0);
-                                    Self::ui_copyable_command(ui, &format!("readlink /proc/{}/fd/* 2>/dev/null | grep 'socket:\\[{}\\]'", pid, conn.inode));
+                                    Self::ui_commands(ui, &connection_commands(self.platform, pid, conn.socket_id));
                                 });
                             });
                         ui.add_space(10.0);
@@ -1130,10 +1425,10 @@ impl VtLensApp {
                 }
                 // STATE A: Process Selected, No Connection Selected
                 else if let Some(p) = focused_process {
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(255, 255, 255))
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)))
-                        .rounding(6.0)
+                        .corner_radius(6.0)
                         .inner_margin(12.0)
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
@@ -1148,10 +1443,10 @@ impl VtLensApp {
                                 ui.add_space(4.0);
                                 ui.label(RichText::new("Comando:").weak().size(9.0));
                                 egui::ScrollArea::vertical()
-                                    .id_source("cmdline_scroll")
+                                    .id_salt("cmdline_scroll")
                                     .max_height(60.0)
                                     .show(ui, |ui| {
-                                        ui.add(egui::Label::new(RichText::new(&p.cmdline).monospace().size(9.0)).wrap(true));
+                                        ui.add(egui::Label::new(RichText::new(&p.cmdline).monospace().size(9.0)).wrap());
                                     });
                             });
                         });
@@ -1165,10 +1460,10 @@ impl VtLensApp {
                     let listen = pid_conns.iter().filter(|c| c.state == "LISTEN").count();
                     let udp_multi = pid_conns.iter().filter(|c| c.protocol.starts_with("udp") || Self::classify_endpoint(&c.remote_addr) == EndpointClass::Multicast).count();
 
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(255, 255, 255))
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)))
-                        .rounding(6.0)
+                        .corner_radius(6.0)
                         .inner_margin(12.0)
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
@@ -1186,20 +1481,14 @@ impl VtLensApp {
                     // Verification commands for process
                     ui.label(RichText::new("VERIFICACIÓN MANUAL").strong().size(10.0).color(ui.visuals().weak_text_color()));
                     ui.add_space(2.0);
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(249, 250, 251))
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)))
-                        .rounding(6.0)
+                        .corner_radius(6.0)
                         .inner_margin(8.0)
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
-                                Self::ui_copyable_command(ui, &format!("ps -fp {}", p.pid));
-                                ui.add_space(4.0);
-                                Self::ui_copyable_command(ui, &format!("ls -l /proc/{}/fd | grep socket", p.pid));
-                                ui.add_space(4.0);
-                                Self::ui_copyable_command(ui, &format!("ss -tunap | grep {}", p.pid));
-                                ui.add_space(4.0);
-                                Self::ui_copyable_command(ui, &format!("lsof -p {} -i", p.pid));
+                                Self::ui_commands(ui, &process_commands(self.platform, p.pid));
                             });
                         });
                     ui.add_space(10.0);
@@ -1213,7 +1502,7 @@ impl VtLensApp {
 
                 ui.horizontal(|ui| {
                     let prev_provider = self.provider;
-                    egui::ComboBox::from_id_source("inspector_provider_combo")
+                    egui::ComboBox::from_id_salt("inspector_provider_combo")
                         .selected_text(self.provider.label())
                         .show_ui(ui, |ui| {
                             for p in LlmProvider::all() {
@@ -1224,7 +1513,7 @@ impl VtLensApp {
                         self.model_name = self.provider.default_model().to_string();
                         self.api_key.clear();
                         self.keyring_status.clear();
-                        if !self.demo_mode && self.provider != LlmProvider::Ollama {
+                        if self.keyring_enabled() && self.provider != LlmProvider::Ollama {
                             self.run_keyring_action(KeyringAction::Load, ui.ctx());
                         }
                     }
@@ -1235,8 +1524,7 @@ impl VtLensApp {
                 if self.provider != LlmProvider::Ollama {
                     ui.add_space(4.0);
                     ui.add(TextEdit::singleline(&mut self.api_key).password(true).hint_text("API Key").desired_width(f32::INFINITY));
-                    // Demo mode never touches the system keyring (safe screenshots).
-                    let keyring_enabled = !self.demo_mode;
+                    let keyring_enabled = self.keyring_enabled();
                     ui.horizontal(|ui| {
                         if ui.add_enabled(keyring_enabled && !self.api_key.trim().is_empty(), egui::Button::new("Guardar en llavero")).clicked() {
                             self.run_keyring_action(KeyringAction::Save(self.api_key.clone()), ui.ctx());
@@ -1250,6 +1538,8 @@ impl VtLensApp {
                     });
                     if self.demo_mode {
                         ui.label(RichText::new("Modo demo: el llavero del sistema está desactivado.").small().weak());
+                    } else if !keyring::AVAILABLE {
+                        ui.label(RichText::new("El llavero todavía solo funciona en Linux: la clave vale para esta sesión.").small().weak());
                     }
                     if !self.keyring_status.is_empty() {
                         ui.label(RichText::new(&self.keyring_status).small().weak());
@@ -1284,7 +1574,7 @@ impl VtLensApp {
                 if !self.analysis_result.is_empty() {
                     ui.add_space(6.0);
                     egui::ScrollArea::vertical()
-                        .id_source("inspector_analysis_scroll")
+                        .id_salt("inspector_analysis_scroll")
                         .max_height(200.0)
                         .show(ui, |ui| {
                             let mut text = self.analysis_result.clone();
@@ -1295,7 +1585,7 @@ impl VtLensApp {
                             );
                         });
                 }
-                
+
                 ui.add_space(8.0);
 
                 // Collapsible Learning Mode panel
@@ -1311,8 +1601,10 @@ impl VtLensApp {
                             ui.label(RichText::new("• 224.0.0.251:5353 suele ser Multicast DNS (mDNS) para descubrimiento local.").size(10.0));
                         } else {
                             ui.label(RichText::new("• Un proceso puede tener muchos file descriptors (FDs). Algunos FDs representan sockets de red.").size(10.0));
-                            ui.add_space(2.0);
-                            ui.label(RichText::new("• VT Lens mapea inodes de sockets desde /proc/<pid>/fd/ hacia /proc/net/tcp y /proc/net/udp.").size(10.0));
+                            for note in source_notes(self.platform) {
+                                ui.add_space(2.0);
+                                ui.label(RichText::new(*note).size(10.0));
+                            }
                         }
                     });
                 });
@@ -1345,49 +1637,90 @@ impl VtLensApp {
     }
 }
 
-/// Public screenshots use this explicit synthetic dataset; no host telemetry is captured.
-pub fn demo_snapshot() -> ProcSnapshot {
-    let processes = [
-        (1420, "browser", "browser --profile demo", 420_000, 12, 2),
-        (1842, "web-server", "web-server --listen 127.0.0.1:8080", 86_000, 6, 1),
-        (2301, "ssh-agent", "ssh-agent", 4_600, 1, 0),
-        (2714, "database", "database --config demo", 152_000, 8, 1),
-        (3380, "vt-lens", "vt-lens --demo", 74_000, 5, 0),
-    ].into_iter().map(|(pid, name, cmdline, rss_kb, threads, socket_count)| ProcessRow {
-        pid, name: name.into(), cmdline: cmdline.into(), state: "S".into(),
-        rss_kb, threads, socket_count, uid: Some(1000),
-    }).collect();
-    let connections = [
-        ("tcp", "127.0.0.1:8080", "0.0.0.0:0", "LISTEN", 1842, "web-server"),
-        ("tcp", "192.0.2.10:53918", "198.51.100.42:443", "ESTABLISHED", 1420, "browser"),
-        ("tcp", "127.0.0.1:5432", "0.0.0.0:0", "LISTEN", 2714, "database"),
-    ].into_iter().enumerate().map(|(index, (protocol, local_addr, remote_addr, state, pid, process))| NetRow {
-        protocol: protocol.into(), local_addr: local_addr.into(), remote_addr: remote_addr.into(),
-        state: state.into(), tx_queue: 0, rx_queue: 0, inode: format!("demo-{index}"),
-        owner: Some(crate::model::SocketOwner { pid, process: process.into() }),
-    }).collect();
-    ProcSnapshot { processes, connections, status: "DEMO · datos sintéticos · sin captura del equipo".into() }
+/// Linux shows the inode, macOS the owner's file descriptor.
+fn socket_id_label(id: SocketId) -> String {
+    match id {
+        SocketId::Inode(inode) => format!("Inode: {inode}"),
+        SocketId::Fd { pid, fd } => format!("FD: {fd} (PID {pid})"),
+    }
+}
+
+/// Commands to check a process by hand, with the tools each OS ships.
+fn process_commands(platform: Platform, pid: u32) -> Vec<String> {
+    match platform {
+        Platform::Linux => vec![
+            format!("ps -fp {pid}"),
+            format!("ls -l /proc/{pid}/fd | grep socket"),
+            format!("ss -tunap | grep {pid}"),
+            format!("lsof -p {pid} -i"),
+        ],
+        Platform::MacOs => vec![
+            format!("ps -fp {pid}"),
+            format!("lsof -nP -a -p {pid} -i"),
+            format!("lsof -nP -a -p {pid} -U"),
+            format!("netstat -anv | grep ':{pid} '"),
+        ],
+    }
+}
+
+/// Commands to check one socket of `pid` by hand.
+fn connection_commands(platform: Platform, pid: u32, socket: SocketId) -> Vec<String> {
+    let mut commands = match platform {
+        Platform::Linux => vec![
+            format!("ss -tunap | grep {pid}"),
+            format!("lsof -p {pid} -i"),
+            format!("ps -fp {pid}"),
+        ],
+        Platform::MacOs => vec![
+            format!("lsof -nP -a -p {pid} -i"),
+            format!("ps -fp {pid}"),
+            format!("netstat -anv | grep ':{pid} '"),
+        ],
+    };
+    match socket {
+        SocketId::Inode(inode) => commands.push(format!(
+            "readlink /proc/{pid}/fd/* 2>/dev/null | grep 'socket:\\[{inode}\\]'"
+        )),
+        SocketId::Fd { fd, .. } => commands.insert(1, format!("lsof -nP -a -p {pid} -d {fd}")),
+    }
+    commands
+}
+
+/// Learning-mode notes on where the tables come from.
+fn source_notes(platform: Platform) -> &'static [&'static str] {
+    match platform {
+        Platform::Linux => &[
+            "• VT Lens mapea inodes de sockets desde /proc/<pid>/fd/ hacia /proc/net/tcp y /proc/net/udp.",
+        ],
+        Platform::MacOs => &[
+            "• macOS no tiene /proc: VT Lens lista los procesos con libproc y los sockets TCP/UDP con lsof.",
+            "• Sin sudo, lsof solo ve los sockets de tus propios procesos; los de root y otros usuarios no aparecen. netstat -anv sí los lista con proceso:pid.",
+            "• De los procesos de otros usuarios (root incluido) macOS solo muestra nombre, PID y usuario sin sudo: su memoria y threads aparecen en 0 y su estado como ?.",
+        ],
+    }
 }
 
 impl eframe::App for VtLensApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         // 1. Capture filter/selection state before rendering
         let prev_proc_filter = self.process_filter.clone();
         let prev_net_filter = self.network_filter.clone();
         let prev_net_filter_type = self.net_filter_type;
         let prev_selected_pid = self.selected_pid;
-        let prev_selected_inode = self.selected_network_inode.clone();
+        let prev_selected_socket = self.selected_socket;
         let prev_only_active = self.only_network_active;
 
         // Poll for snapshots from background thread
-        if let Ok(snapshot) = self.rx_snapshot.try_recv() {
-            if self.auto_refresh {
-                self.processes = snapshot.processes;
-                self.connections = snapshot.connections;
-                self.status = snapshot.status;
-                self.last_snapshot_time = Instant::now();
-                self.update_caches();
-            }
+        if let Ok(snapshot) = self.rx_snapshot.try_recv()
+            && (self.auto_refresh || self.refresh_requested)
+        {
+            self.refresh_requested = false;
+            self.processes = snapshot.processes;
+            self.connections = snapshot.connections;
+            self.status = snapshot.status;
+            self.last_snapshot_time = Instant::now();
+            self.update_caches();
         }
 
         // Poll for LLM analysis results
@@ -1422,7 +1755,9 @@ impl eframe::App for VtLensApp {
                     }
                     self.keyring_status = "Clave cargada del llavero".to_string();
                 }
-                Ok(KeyringOutcome::Saved) => self.keyring_status = "Clave guardada en el llavero".to_string(),
+                Ok(KeyringOutcome::Saved) => {
+                    self.keyring_status = "Clave guardada en el llavero".to_string()
+                }
                 Ok(KeyringOutcome::Cleared) => {
                     self.api_key.clear();
                     self.keyring_status = "Clave borrada del llavero".to_string();
@@ -1434,20 +1769,24 @@ impl eframe::App for VtLensApp {
         ctx.request_repaint_after(Duration::from_millis(500));
 
         // Header Panel
-        egui::TopBottomPanel::top("header")
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(255, 255, 255)).inner_margin(egui::Margin::symmetric(16.0, 12.0)))
-            .show(ctx, |ui| self.show_header(ui));
+        egui::Panel::top("header")
+            .frame(
+                egui::Frame::NONE
+                    .fill(egui::Color32::from_rgb(255, 255, 255))
+                    .inner_margin(egui::Margin::symmetric(16, 12)),
+            )
+            .show(ui, |ui| self.show_header(ui));
 
         // Bottom Status Bar
-        egui::TopBottomPanel::bottom("status_bar")
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(249, 250, 251)).inner_margin(egui::Margin::symmetric(16.0, 8.0)))
-            .show(ctx, |ui| {
+        egui::Panel::bottom("status_bar")
+            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(249, 250, 251)).inner_margin(egui::Margin::symmetric(16, 8)))
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let total_proc = self.processes.len();
                     let total_sock = self.connections.len();
                     let visible_sock = self.filtered_connections_cache.len();
                     let age = self.last_snapshot_time.elapsed().as_secs();
-                    
+
                     let selection_info = if let Some(pid) = self.selected_pid {
                         let proc_name = self.processes.iter().find(|p| p.pid == pid).map(|p| p.name.as_str()).unwrap_or("unknown");
                         format!(" · seleccionado {} PID {}", proc_name, pid)
@@ -1456,38 +1795,55 @@ impl eframe::App for VtLensApp {
                     };
 
                     let status_text = format!(
-                        "{} procesos · {} sockets · {} visibles{} · último escaneo hace {}s · /proc no root",
-                        total_proc, total_sock, visible_sock, selection_info, age
+                        "{} procesos · {} sockets · {} visibles{} · último escaneo hace {}s · {} no root",
+                        total_proc,
+                        total_sock,
+                        visible_sock,
+                        selection_info,
+                        age,
+                        self.platform.source_label()
                     );
                     ui.label(RichText::new(status_text).weak().size(11.0));
                 });
             });
 
         // Left Process Sidebar
-        egui::SidePanel::left("processes")
+        egui::Panel::left("processes")
             .resizable(true)
-            .default_width(280.0)
-            .min_width(180.0)
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(249, 250, 251)).inner_margin(12.0))
-            .show(ctx, |ui| self.show_processes(ui));
+            .default_size(280.0)
+            .min_size(180.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(egui::Color32::from_rgb(249, 250, 251))
+                    .inner_margin(12.0),
+            )
+            .show(ui, |ui| self.show_processes(ui));
 
         // Right Inspector Panel (collapsible slide-out)
-        let show_inspector = self.selected_pid.is_some() || self.selected_network_inode.is_some();
+        let show_inspector = self.selected_pid.is_some() || self.selected_socket.is_some();
         if show_inspector {
-            egui::SidePanel::right("inspector")
+            egui::Panel::right("inspector")
                 .resizable(true)
-                .default_width(320.0)
-                .min_width(180.0)
-                .frame(egui::Frame::none().fill(egui::Color32::from_rgb(255, 255, 255)).inner_margin(12.0))
-                .show(ctx, |ui| {
+                .default_size(320.0)
+                .min_size(180.0)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(egui::Color32::from_rgb(255, 255, 255))
+                        .inner_margin(12.0),
+                )
+                .show(ui, |ui| {
                     self.render_inspector_panel(ui);
                 });
         }
 
         // Central Panel (Network Connections Table)
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(246, 248, 250)).inner_margin(16.0))
-            .show(ctx, |ui| {
+            .frame(
+                egui::Frame::NONE
+                    .fill(egui::Color32::from_rgb(246, 248, 250))
+                    .inner_margin(16.0),
+            )
+            .show(ui, |ui| {
                 self.show_network(ui);
             });
 
@@ -1496,7 +1852,7 @@ impl eframe::App for VtLensApp {
             || self.network_filter != prev_net_filter
             || self.net_filter_type != prev_net_filter_type
             || self.selected_pid != prev_selected_pid
-            || self.selected_network_inode != prev_selected_inode
+            || self.selected_socket != prev_selected_socket
             || self.only_network_active != prev_only_active
         {
             self.update_caches();
@@ -1642,8 +1998,7 @@ fn perform_llm_stream_request(
         }
 
         // Standard SSE event line: "data: {JSON}"
-        if trimmed.starts_with("data: ") {
-            let data_str = &trimmed["data: ".len()..];
+        if let Some(data_str) = trimmed.strip_prefix("data: ") {
             if data_str.trim() == "[DONE]" {
                 break;
             }
@@ -1651,11 +2006,15 @@ fn perform_llm_stream_request(
             if let Ok(json_chunk) = serde_json::from_str::<serde_json::Value>(data_str) {
                 let chunk_text = match provider {
                     LlmProvider::OpenRouter | LlmProvider::OpenAI => {
-                        json_chunk["choices"][0]["delta"]["content"].as_str().map(|s| s.to_string())
+                        json_chunk["choices"][0]["delta"]["content"]
+                            .as_str()
+                            .map(|s| s.to_string())
                     }
                     LlmProvider::Anthropic => {
                         if json_chunk["type"] == "error" {
-                            let message = json_chunk["error"]["message"].as_str().unwrap_or("error del proveedor");
+                            let message = json_chunk["error"]["message"]
+                                .as_str()
+                                .unwrap_or("error del proveedor");
                             return Err(format!("El proveedor cortó la respuesta: {message}"));
                         }
                         if json_chunk["delta"]["stop_reason"] == "refusal" {
@@ -1665,9 +2024,9 @@ fn perform_llm_stream_request(
                             json_chunk["delta"]["text"].as_str().map(|s| s.to_string())
                         }
                     }
-                    LlmProvider::Ollama => {
-                        json_chunk["message"]["content"].as_str().map(|s| s.to_string())
-                    }
+                    LlmProvider::Ollama => json_chunk["message"]["content"]
+                        .as_str()
+                        .map(|s| s.to_string()),
                 };
 
                 if let Some(text) = chunk_text {
@@ -1677,41 +2036,14 @@ fn perform_llm_stream_request(
             }
         } else if provider == LlmProvider::Ollama {
             // Ollama might output raw JSON line directly
-            if let Ok(json_chunk) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if let Some(text) = json_chunk["message"]["content"].as_str() {
-                    let _ = tx.send(LlmMessage::Chunk(text.to_string()));
-                    ctx.request_repaint();
-                }
+            if let Ok(json_chunk) = serde_json::from_str::<serde_json::Value>(trimmed)
+                && let Some(text) = json_chunk["message"]["content"].as_str()
+            {
+                let _ = tx.send(LlmMessage::Chunk(text.to_string()));
+                ctx.request_repaint();
             }
         }
     }
 
     Ok(())
-}
-
-pub fn capture_system_snapshot() -> ProcSnapshot {
-    let owners = socket_owners();
-    let mut processes = read_processes();
-    let mut socket_counts: HashMap<u32, usize> = HashMap::new();
-
-    for owner in owners.values() {
-        *socket_counts.entry(owner.pid).or_default() += 1;
-    }
-
-    for process in &mut processes {
-        process.socket_count = socket_counts.get(&process.pid).copied().unwrap_or(0);
-    }
-
-    let connections = read_connections(&owners);
-    let status = format!(
-        "{} processes · {} connections · connection-level capture (no root)",
-        processes.len(),
-        connections.len()
-    );
-
-    ProcSnapshot {
-        processes,
-        connections,
-        status,
-    }
 }
