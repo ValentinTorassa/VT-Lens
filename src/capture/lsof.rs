@@ -16,11 +16,14 @@ use crate::model::{NetRow, SocketId, SocketOwner};
 
 /// Absolute path, so a `lsof` earlier in `$PATH` is never run instead.
 const LSOF: &str = "/usr/sbin/lsof";
+#[rustfmt::skip]
 const ARGS: &[&str] = &[
-    "-nP", // no DNS or port-name lookups
-    "-w",  // no warnings on stderr
-    "+c", "0", // full command names
-    "-iTCP", "-iUDP", "-F", "pcfdtPnT", "-T", "qs", // TCP queue sizes and state
+    "-nP",               // no DNS or port-name lookups
+    "-w",                // no warnings on stderr
+    "+c", "0",           // full command names
+    "-iTCP", "-iUDP",    // internet sockets only
+    "-F", "pcfdtPnT",    // field output, see above
+    "-T", "qs",          // TCP queue sizes and state
 ];
 
 /// Runs lsof and parses its output. An error or a missing lsof yields no rows.
