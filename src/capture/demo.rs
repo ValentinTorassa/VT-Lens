@@ -222,7 +222,9 @@ impl CaptureSource for DemoSource {
         Snapshot {
             processes,
             connections,
-            status: "DEMO · datos sintéticos · sin captura del equipo".into(),
+            // ASCII on purpose: the Markdown export keeps only [A-Za-z0-9 ()_-]
+            // of the status line, which turned "sintéticos" into "sintticos".
+            status: "DEMO - synthetic data (nothing captured from this machine)".into(),
         }
     }
 }

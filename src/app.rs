@@ -861,7 +861,7 @@ impl VtLensApp {
                         .find(|p| p.pid == pid)
                         .map(|p| p.name.as_str())
                         .unwrap_or("Proceso");
-                    let chip_text = format!("Proceso: {} ({}) ✕", proc_name, pid);
+                    let chip_text = format!("Proceso: {} ({}) ×", proc_name, pid);
                     if ui
                         .button(
                             RichText::new(chip_text)
@@ -885,7 +885,7 @@ impl VtLensApp {
                         NetFilterType::Udp => "UDP",
                         NetFilterType::All => "",
                     };
-                    let chip_text = format!("Tipo: {} ✕", type_str);
+                    let chip_text = format!("Tipo: {} ×", type_str);
                     if ui
                         .button(
                             RichText::new(chip_text)
@@ -900,7 +900,7 @@ impl VtLensApp {
                 }
 
                 if !self.network_filter.trim().is_empty() {
-                    let chip_text = format!("Búsqueda: \"{}\" ✕", self.network_filter.trim());
+                    let chip_text = format!("Búsqueda: \"{}\" ×", self.network_filter.trim());
                     if ui
                         .button(
                             RichText::new(chip_text)
@@ -1214,10 +1214,17 @@ impl VtLensApp {
                                             .size(11.0)
                                     }
                                     EndpointClass::External => {
+                                        // Sky-blue text would vanish on the
+                                        // sky-blue selection highlight.
+                                        let color = if selected {
+                                            egui::Color32::WHITE
+                                        } else {
+                                            egui::Color32::from_rgb(14, 165, 233)
+                                        };
                                         RichText::new(format!("{} 🌐", resolved_addr))
                                             .monospace()
                                             .size(11.0)
-                                            .color(egui::Color32::from_rgb(14, 165, 233))
+                                            .color(color)
                                     }
                                     _ => RichText::new(&resolved_addr).monospace().size(11.0),
                                 };
@@ -1308,7 +1315,7 @@ impl VtLensApp {
                     .color(ui.visuals().weak_text_color()),
             );
             ui.add_space(4.0);
-            if ui.button("✕").on_hover_text("Limpiar selección").clicked() {
+            if ui.button("×").on_hover_text("Limpiar selección").clicked() {
                 self.selected_pid = None;
                 self.selected_socket = None;
             }
