@@ -410,10 +410,10 @@ impl VtLensApp {
             .connections
             .iter()
             .filter(|connection| {
-                if let Some(selected_pid) = self.selected_pid {
-                    if connection.owner.as_ref().map(|owner| owner.pid) != Some(selected_pid) {
-                        return false;
-                    }
+                if let Some(selected_pid) = self.selected_pid
+                    && connection.owner.as_ref().map(|owner| owner.pid) != Some(selected_pid)
+                {
+                    return false;
                 }
 
                 match self.net_filter_type {
@@ -465,10 +465,10 @@ impl VtLensApp {
         // 4. Validate selected connection matches selected process PID
         if let Some(inode) = &self.selected_network_inode {
             if let Some(connection) = self.connections.iter().find(|c| &c.inode == inode) {
-                if let Some(selected_pid) = self.selected_pid {
-                    if connection.owner.as_ref().map(|owner| owner.pid) != Some(selected_pid) {
-                        self.selected_network_inode = None;
-                    }
+                if let Some(selected_pid) = self.selected_pid
+                    && connection.owner.as_ref().map(|owner| owner.pid) != Some(selected_pid)
+                {
+                    self.selected_network_inode = None;
                 }
             } else {
                 self.selected_network_inode = None;
@@ -1158,18 +1158,13 @@ impl VtLensApp {
                                             if !self.demo_mode
                                                 && (remote_class == EndpointClass::External
                                                     || remote_class == EndpointClass::PrivateLan)
+                                                && let Ok(mut resolving) = self.dns_resolving.lock()
+                                                && resolving.insert(connection.remote_addr.clone())
                                             {
-                                                if let Ok(mut resolving) = self.dns_resolving.lock()
-                                                {
-                                                    if resolving
-                                                        .insert(connection.remote_addr.clone())
-                                                    {
-                                                        let _ = self.tx_dns.send(DnsRequest {
-                                                            ip: connection.remote_addr.clone(),
-                                                            ctx: ui.ctx().clone(),
-                                                        });
-                                                    }
-                                                }
+                                                let _ = self.tx_dns.send(DnsRequest {
+                                                    ip: connection.remote_addr.clone(),
+                                                    ctx: ui.ctx().clone(),
+                                                });
                                             }
                                             connection.remote_addr.clone()
                                         },
@@ -1293,16 +1288,15 @@ impl VtLensApp {
 
         // Resolve connection owner if a socket is selected but no process selected
         let mut selected_conn = None;
-        if let Some(inode) = &self.selected_network_inode {
-            if let Some(connection) = self.connections.iter().find(|c| &c.inode == inode) {
-                selected_conn = Some(connection.clone());
-                if focused_pid.is_none() {
-                    if let Some(owner) = &connection.owner {
-                        focused_pid = Some(owner.pid);
-                        focused_process =
-                            self.processes.iter().find(|p| p.pid == owner.pid).cloned();
-                    }
-                }
+        if let Some(inode) = &self.selected_network_inode
+            && let Some(connection) = self.connections.iter().find(|c| &c.inode == inode)
+        {
+            selected_conn = Some(connection.clone());
+            if focused_pid.is_none()
+                && let Some(owner) = &connection.owner
+            {
+                focused_pid = Some(owner.pid);
+                focused_process = self.processes.iter().find(|p| p.pid == owner.pid).cloned();
             }
         }
 
@@ -1702,14 +1696,14 @@ impl eframe::App for VtLensApp {
         let prev_only_active = self.only_network_active;
 
         // Poll for snapshots from background thread
-        if let Ok(snapshot) = self.rx_snapshot.try_recv() {
-            if self.auto_refresh {
-                self.processes = snapshot.processes;
-                self.connections = snapshot.connections;
-                self.status = snapshot.status;
-                self.last_snapshot_time = Instant::now();
-                self.update_caches();
-            }
+        if let Ok(snapshot) = self.rx_snapshot.try_recv()
+            && self.auto_refresh
+        {
+            self.processes = snapshot.processes;
+            self.connections = snapshot.connections;
+            self.status = snapshot.status;
+            self.last_snapshot_time = Instant::now();
+            self.update_caches();
         }
 
         // Poll for LLM analysis results
@@ -1982,8 +1976,7 @@ fn perform_llm_stream_request(
         }
 
         // Standard SSE event line: "data: {JSON}"
-        if trimmed.starts_with("data: ") {
-            let data_str = &trimmed["data: ".len()..];
+        if let Some(data_str) = trimmed.strip_prefix("data: ") {
             if data_str.trim() == "[DONE]" {
                 break;
             }
@@ -2021,11 +2014,11 @@ fn perform_llm_stream_request(
             }
         } else if provider == LlmProvider::Ollama {
             // Ollama might output raw JSON line directly
-            if let Ok(json_chunk) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if let Some(text) = json_chunk["message"]["content"].as_str() {
-                    let _ = tx.send(LlmMessage::Chunk(text.to_string()));
-                    ctx.request_repaint();
-                }
+            if let Ok(json_chunk) = serde_json::from_str::<serde_json::Value>(trimmed)
+                && let Some(text) = json_chunk["message"]["content"].as_str()
+            {
+                let _ = tx.send(LlmMessage::Chunk(text.to_string()));
+                ctx.request_repaint();
             }
         }
     }
