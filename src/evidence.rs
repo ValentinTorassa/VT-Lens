@@ -29,7 +29,10 @@ fn parse_endpoint(addr: &str) -> Option<SocketAddr> {
 /// IPv4-mapped IPv6 (::ffff:a.b.c.d) is classified as the IPv4 address it carries.
 fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
         v4 => v4,
     }
 }
@@ -84,7 +87,11 @@ pub fn endpoint_label(addr: &str, local: bool) -> String {
     let ip = canonical(sa.ip());
     let family = if ip.is_ipv4() { "v4" } else { "v6" };
     let class = if ip.is_unspecified() {
-        if local { "todas-las-interfaces" } else { return "sin-par".to_string() }
+        if local {
+            "todas-las-interfaces"
+        } else {
+            return "sin-par".to_string();
+        }
     } else if ip.is_loopback() {
         "loopback"
     } else if is_multicast(ip) {
@@ -101,18 +108,36 @@ pub fn endpoint_label(addr: &str, local: bool) -> String {
 pub fn safe_process_name(name: &str) -> String {
     let clean: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+') {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(32)
         .collect();
-    if clean.trim_matches('_').is_empty() { "(sin nombre)".to_string() } else { clean }
+    if clean.trim_matches('_').is_empty() {
+        "(sin nombre)".to_string()
+    } else {
+        clean
+    }
 }
 
 fn safe_token(value: &str, max: usize) -> String {
-    value.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '(' | ')' | '_' | '-')).take(max).collect()
+    value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '(' | ')' | '_' | '-'))
+        .take(max)
+        .collect()
 }
 
 fn safe_digits(value: &str) -> String {
-    value.chars().filter(char::is_ascii_digit).take(20).collect()
+    value
+        .chars()
+        .filter(char::is_ascii_digit)
+        .take(20)
+        .collect()
 }
 
 pub fn uid_class(uid: Option<u32>) -> &'static str {
@@ -152,11 +177,20 @@ fn connection_line(conn: &NetRow) -> String {
 fn push_selected_connection(out: &mut String, conn: &NetRow) {
     out.push_str("Selected connection:\n");
     out.push_str(&format!("* protocol: {}\n", safe_token(&conn.protocol, 8)));
-    out.push_str(&format!("* local: {}\n", endpoint_label(&conn.local_addr, true)));
-    out.push_str(&format!("* remote: {}\n", endpoint_label(&conn.remote_addr, false)));
+    out.push_str(&format!(
+        "* local: {}\n",
+        endpoint_label(&conn.local_addr, true)
+    ));
+    out.push_str(&format!(
+        "* remote: {}\n",
+        endpoint_label(&conn.remote_addr, false)
+    ));
     out.push_str(&format!("* state: {}\n", safe_token(&conn.state, 16)));
     out.push_str(&format!("* inode: {}\n", safe_digits(&conn.inode)));
-    out.push_str(&format!("* classification: {:?}\n\n", classify(&conn.remote_addr)));
+    out.push_str(&format!(
+        "* classification: {:?}\n\n",
+        classify(&conn.remote_addr)
+    ));
 }
 
 pub fn build_evidence(input: &EvidenceInput) -> String {
@@ -180,11 +214,24 @@ pub fn build_evidence(input: &EvidenceInput) -> String {
                 .as_ref()
                 .map(|o| format!("{} ({})", safe_process_name(&o.process), o.pid))
                 .unwrap_or_else(|| "unknown".to_string());
-            let marker = if Some(conn.inode.as_str()) == input.selected_inode { " [SELECTED_CONNECTION]" } else { "" };
-            out.push_str(&format!("{}. {} owner={}{}\n", idx + 1, connection_line(conn), owner, marker));
+            let marker = if Some(conn.inode.as_str()) == input.selected_inode {
+                " [SELECTED_CONNECTION]"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "{}. {} owner={}{}\n",
+                idx + 1,
+                connection_line(conn),
+                owner,
+                marker
+            ));
         }
         if input.sample.len() > 20 {
-            out.push_str(&format!("... and {} more connections.\n", input.sample.len() - 20));
+            out.push_str(&format!(
+                "... and {} more connections.\n",
+                input.sample.len() - 20
+            ));
         }
         return out;
     };
@@ -193,7 +240,10 @@ pub fn build_evidence(input: &EvidenceInput) -> String {
         Some(p) => {
             out.push_str("Selected process:\n");
             out.push_str(&format!("* pid: {}\n", p.pid));
-            out.push_str(&format!("* comm (binario): {}\n", safe_process_name(&p.name)));
+            out.push_str(&format!(
+                "* comm (binario): {}\n",
+                safe_process_name(&p.name)
+            ));
             out.push_str(&format!("* state: {}\n", safe_token(&p.state, 24)));
             out.push_str(&format!("* uid_class: {}\n", uid_class(p.uid)));
             out.push_str(&format!("* rss_mb: {:.1}\n", p.rss_mb()));
@@ -204,16 +254,38 @@ pub fn build_evidence(input: &EvidenceInput) -> String {
         None => out.push_str(&format!("Selected process PID: {pid}\n\n")),
     }
 
-    let pid_conns: Vec<&NetRow> = input.connections.iter().filter(|c| owner_pid(c) == Some(pid)).collect();
-    let count = |class: EndpointClass| pid_conns.iter().filter(|c| classify(&c.remote_addr) == class).count();
+    let pid_conns: Vec<&NetRow> = input
+        .connections
+        .iter()
+        .filter(|c| owner_pid(c) == Some(pid))
+        .collect();
+    let count = |class: EndpointClass| {
+        pid_conns
+            .iter()
+            .filter(|c| classify(&c.remote_addr) == class)
+            .count()
+    };
     out.push_str("Connection summary for this PID:\n");
-    out.push_str(&format!("* total_current_connections: {}\n", pid_conns.len()));
+    out.push_str(&format!(
+        "* total_current_connections: {}\n",
+        pid_conns.len()
+    ));
     out.push_str(&format!("* external: {}\n", count(EndpointClass::External)));
-    out.push_str(&format!("* localhost: {}\n", count(EndpointClass::Localhost)));
-    out.push_str(&format!("* listening: {}\n", pid_conns.iter().filter(|c| c.state == "LISTEN").count()));
+    out.push_str(&format!(
+        "* localhost: {}\n",
+        count(EndpointClass::Localhost)
+    ));
+    out.push_str(&format!(
+        "* listening: {}\n",
+        pid_conns.iter().filter(|c| c.state == "LISTEN").count()
+    ));
     out.push_str(&format!(
         "* udp_multicast: {}\n\n",
-        pid_conns.iter().filter(|c| c.protocol.starts_with("udp") || classify(&c.remote_addr) == EndpointClass::Multicast).count()
+        pid_conns
+            .iter()
+            .filter(|c| c.protocol.starts_with("udp")
+                || classify(&c.remote_addr) == EndpointClass::Multicast)
+            .count()
     ));
 
     if let Some(conn) = selected_conn {
@@ -232,11 +304,23 @@ pub fn build_evidence(input: &EvidenceInput) -> String {
         );
     }
     for (idx, conn) in pid_conns.iter().take(20).enumerate() {
-        let marker = if Some(conn.inode.as_str()) == input.selected_inode { " [SELECTED_CONNECTION]" } else { "" };
-        out.push_str(&format!("{}. {}{}\n", idx + 1, connection_line(conn), marker));
+        let marker = if Some(conn.inode.as_str()) == input.selected_inode {
+            " [SELECTED_CONNECTION]"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "{}. {}{}\n",
+            idx + 1,
+            connection_line(conn),
+            marker
+        ));
     }
     if pid_conns.len() > 20 {
-        out.push_str(&format!("... and {} more connections.\n", pid_conns.len() - 20));
+        out.push_str(&format!(
+            "... and {} more connections.\n",
+            pid_conns.len() - 20
+        ));
     }
     out
 }
@@ -267,15 +351,32 @@ pub fn build_markdown(input: &EvidenceInput, status: &str) -> String {
         md.push('\n');
     }
 
-    if let Some(conn) = input.selected_inode.and_then(|inode| input.connections.iter().find(|c| c.inode == inode)) {
+    if let Some(conn) = input
+        .selected_inode
+        .and_then(|inode| input.connections.iter().find(|c| c.inode == inode))
+    {
         md.push_str("## Focused Network Connection\n\n");
         md.push_str(&format!("- Protocol: {}\n", safe_token(&conn.protocol, 8)));
-        md.push_str(&format!("- Local: `{}`\n", endpoint_label(&conn.local_addr, true)));
-        md.push_str(&format!("- Remote: `{}`\n", endpoint_label(&conn.remote_addr, false)));
+        md.push_str(&format!(
+            "- Local: `{}`\n",
+            endpoint_label(&conn.local_addr, true)
+        ));
+        md.push_str(&format!(
+            "- Remote: `{}`\n",
+            endpoint_label(&conn.remote_addr, false)
+        ));
         md.push_str(&format!("- State: {}\n", safe_token(&conn.state, 16)));
-        md.push_str(&format!("- Owner PID: {}\n", owner_pid(conn).map(|p| p.to_string()).unwrap_or_else(|| "unknown".into())));
+        md.push_str(&format!(
+            "- Owner PID: {}\n",
+            owner_pid(conn)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        ));
         md.push_str(&format!("- Inode: {}\n", safe_digits(&conn.inode)));
-        md.push_str(&format!("- Queues: tx={} rx={}\n\n", conn.tx_queue, conn.rx_queue));
+        md.push_str(&format!(
+            "- Queues: tx={} rx={}\n\n",
+            conn.tx_queue, conn.rx_queue
+        ));
     }
 
     md.push_str("## Network Sample\n\n| Proto | Local | Remote | State | Owner | Queues |\n| --- | --- | --- | --- | --- | --- |\n");
@@ -286,7 +387,9 @@ pub fn build_markdown(input: &EvidenceInput, status: &str) -> String {
             endpoint_label(&conn.local_addr, true),
             endpoint_label(&conn.remote_addr, false),
             safe_token(&conn.state, 16),
-            owner_pid(conn).map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
+            owner_pid(conn)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unknown".into()),
             conn.tx_queue,
             conn.rx_queue,
         ));
@@ -299,7 +402,14 @@ mod tests {
     use super::*;
     use crate::model::SocketOwner;
 
-    fn conn(local: &str, remote: &str, state: &str, pid: u32, process: &str, inode: &str) -> NetRow {
+    fn conn(
+        local: &str,
+        remote: &str,
+        state: &str,
+        pid: u32,
+        process: &str,
+        inode: &str,
+    ) -> NetRow {
         NetRow {
             protocol: "tcp".into(),
             local_addr: local.into(),
@@ -308,7 +418,10 @@ mod tests {
             tx_queue: 0,
             rx_queue: 0,
             inode: inode.into(),
-            owner: Some(SocketOwner { pid, process: process.into() }),
+            owner: Some(SocketOwner {
+                pid,
+                process: process.into(),
+            }),
         }
     }
 
@@ -321,9 +434,15 @@ mod tests {
         assert_eq!(classify("100.100.2.3:443"), EndpointClass::PrivateLan);
         assert_eq!(classify("172.32.0.1:443"), EndpointClass::External);
         assert_eq!(classify("[::1]:631"), EndpointClass::Localhost);
-        assert_eq!(classify("[::ffff:127.0.0.1]:8080"), EndpointClass::Localhost);
+        assert_eq!(
+            classify("[::ffff:127.0.0.1]:8080"),
+            EndpointClass::Localhost
+        );
         assert_eq!(classify("[fe80::1]:22"), EndpointClass::PrivateLan);
-        assert_eq!(classify("[fd7a:115c:a1e0::1]:22"), EndpointClass::PrivateLan);
+        assert_eq!(
+            classify("[fd7a:115c:a1e0::1]:22"),
+            EndpointClass::PrivateLan
+        );
         assert_eq!(classify("[ff02::fb]:5353"), EndpointClass::Multicast);
         assert_eq!(classify("224.0.0.251:5353"), EndpointClass::Multicast);
         assert_eq!(classify("0.0.0.0:0"), EndpointClass::Listening);
@@ -335,10 +454,16 @@ mod tests {
     #[test]
     fn endpoint_labels_drop_the_address() {
         assert_eq!(endpoint_label("203.0.113.7:443", false), "externa/v4:443");
-        assert_eq!(endpoint_label("0.0.0.0:22", true), "todas-las-interfaces/v4:22");
+        assert_eq!(
+            endpoint_label("0.0.0.0:22", true),
+            "todas-las-interfaces/v4:22"
+        );
         assert_eq!(endpoint_label("0.0.0.0:0", false), "sin-par");
         assert_eq!(endpoint_label("[::1]:631", true), "loopback/v6:631");
-        assert_eq!(endpoint_label("192.168.100.3:22", false), "red-privada/v4:22");
+        assert_eq!(
+            endpoint_label("192.168.100.3:22", false),
+            "red-privada/v4:22"
+        );
     }
 
     #[test]
@@ -359,7 +484,9 @@ mod tests {
         let processes = vec![ProcessRow {
             pid: 4242,
             name: "agent".into(),
-            cmdline: "agent --token=CANARY-TOKEN /home/alice/secret-project OPENAI_API_KEY=CANARY-KEY".into(),
+            cmdline:
+                "agent --token=CANARY-TOKEN /home/alice/secret-project OPENAI_API_KEY=CANARY-KEY"
+                    .into(),
             state: "S (sleeping)".into(),
             rss_kb: 2048,
             threads: 3,
@@ -367,8 +494,22 @@ mod tests {
             uid: Some(1000),
         }];
         let connections = vec![
-            conn("192.168.100.3:53918", "203.0.113.99:443", "ESTABLISHED", 4242, "agent", "111"),
-            conn("127.0.0.1:8080", "0.0.0.0:0", "LISTEN", 4242, "agent", "222"),
+            conn(
+                "192.168.100.3:53918",
+                "203.0.113.99:443",
+                "ESTABLISHED",
+                4242,
+                "agent",
+                "111",
+            ),
+            conn(
+                "127.0.0.1:8080",
+                "0.0.0.0:0",
+                "LISTEN",
+                4242,
+                "agent",
+                "222",
+            ),
         ];
         for selected_pid in [Some(4242), None] {
             let input = EvidenceInput {
@@ -378,9 +519,23 @@ mod tests {
                 selected_inode: Some("111"),
                 sample: &connections,
             };
-            for text in [build_evidence(&input), build_markdown(&input, "2 processes")] {
-                for canary in ["CANARY", "alice", "secret-project", "203.0.113", "192.168.100", "127.0.0.1", "--token"] {
-                    assert!(!text.contains(canary), "{canary} leaked (pid {selected_pid:?}):\n{text}");
+            for text in [
+                build_evidence(&input),
+                build_markdown(&input, "2 processes"),
+            ] {
+                for canary in [
+                    "CANARY",
+                    "alice",
+                    "secret-project",
+                    "203.0.113",
+                    "192.168.100",
+                    "127.0.0.1",
+                    "--token",
+                ] {
+                    assert!(
+                        !text.contains(canary),
+                        "{canary} leaked (pid {selected_pid:?}):\n{text}"
+                    );
                 }
                 assert!(text.contains("externa/v4:443"), "{text}");
                 assert!(text.contains("loopback/v4:8080"), "{text}");

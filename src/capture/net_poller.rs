@@ -158,7 +158,11 @@ fn parse_ipv6(value: &str) -> Option<std::net::Ipv6Addr> {
     let mut bytes = [0u8; 16];
     for word in 0..4 {
         let raw = u32::from_str_radix(&value[word * 8..word * 8 + 8], 16).ok()?;
-        let ordered = if cfg!(target_endian = "little") { raw.swap_bytes() } else { raw };
+        let ordered = if cfg!(target_endian = "little") {
+            raw.swap_bytes()
+        } else {
+            raw
+        };
         bytes[word * 4..word * 4 + 4].copy_from_slice(&ordered.to_be_bytes());
     }
     Some(std::net::Ipv6Addr::from(bytes))
@@ -188,17 +192,32 @@ mod tests {
     #[test]
     fn parses_ipv4_little_endian_proc_addr() {
         assert_eq!(parse_ipv4("0100007F").as_deref(), Some("127.0.0.1"));
-        assert_eq!(parse_addr_port("0100007F:1F90", false).as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(
+            parse_addr_port("0100007F:1F90", false).as_deref(),
+            Some("127.0.0.1:8080")
+        );
     }
 
     #[test]
     fn parses_ipv6_in_kernel_word_order() {
-        assert_eq!(parse_addr_port("00000000000000000000000001000000:0277", true).as_deref(), Some("[::1]:631"));
-        assert_eq!(parse_addr_port("00000000000000000000000000000000:0016", true).as_deref(), Some("[::]:22"));
+        assert_eq!(
+            parse_addr_port("00000000000000000000000001000000:0277", true).as_deref(),
+            Some("[::1]:631")
+        );
+        assert_eq!(
+            parse_addr_port("00000000000000000000000000000000:0016", true).as_deref(),
+            Some("[::]:22")
+        );
         // 2001:db8::1 as the kernel prints it
-        assert_eq!(parse_addr_port("B80D0120000000000000000001000000:01BB", true).as_deref(), Some("[2001:db8::1]:443"));
+        assert_eq!(
+            parse_addr_port("B80D0120000000000000000001000000:01BB", true).as_deref(),
+            Some("[2001:db8::1]:443")
+        );
         // IPv4-mapped 127.0.0.1
-        assert_eq!(parse_addr_port("0000000000000000FFFF00000100007F:1F90", true).as_deref(), Some("[::ffff:127.0.0.1]:8080"));
+        assert_eq!(
+            parse_addr_port("0000000000000000FFFF00000100007F:1F90", true).as_deref(),
+            Some("[::ffff:127.0.0.1]:8080")
+        );
         assert_eq!(parse_addr_port("zz:0016", true), None);
     }
 

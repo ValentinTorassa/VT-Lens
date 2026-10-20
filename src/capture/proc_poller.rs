@@ -85,7 +85,11 @@ fn parse_status_u32(status: &str, key: &str) -> Option<u32> {
 
 /// `Uid:` lists real, effective, saved and filesystem UIDs; keep the real one.
 fn parse_status_uid(status: &str) -> Option<u32> {
-    parse_status_value(status, "Uid")?.split_whitespace().next()?.parse().ok()
+    parse_status_value(status, "Uid")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn parse_status_value<'a>(status: &'a str, key: &str) -> Option<&'a str> {
@@ -103,16 +107,26 @@ mod tests {
     fn parses_status_values() {
         let status = "Name:\tbash\nState:\tS (sleeping)\nVmRSS:\t  2048 kB\nThreads:\t3\n";
 
-        assert_eq!(parse_status_string(status, "State").as_deref(), Some("S (sleeping)"));
+        assert_eq!(
+            parse_status_string(status, "State").as_deref(),
+            Some("S (sleeping)")
+        );
         assert_eq!(parse_status_kb(status, "VmRSS"), Some(2048));
         assert_eq!(parse_status_u32(status, "Threads"), Some(3));
-        assert_eq!(parse_status_uid("Uid:\t1000\t1000\t1000\t1000\n"), Some(1000));
+        assert_eq!(
+            parse_status_uid("Uid:\t1000\t1000\t1000\t1000\n"),
+            Some(1000)
+        );
     }
 
     #[test]
     fn cmdline_arguments_lose_control_characters() {
         let dir = std::env::temp_dir().join(format!("vt-lens-cmdline-{}", std::process::id()));
-        std::fs::write(&dir, b"bash\0-c\0echo start\nexport OPENAI_API_KEY=canary\0").unwrap();
+        std::fs::write(
+            &dir,
+            b"bash\0-c\0echo start\nexport OPENAI_API_KEY=canary\0",
+        )
+        .unwrap();
         let cmdline = read_cmdline(&dir).unwrap();
         let _ = std::fs::remove_file(&dir);
         assert!(!cmdline.contains('\n'), "{cmdline:?}");
