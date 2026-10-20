@@ -1,8 +1,9 @@
 name: Release
 
-# Pushing a tag like v0.2.0 builds the prebuilt binaries and publishes them as a
-# GitHub release. Running it by hand (workflow_dispatch) is a dry run: it builds
-# and uploads the same files as workflow artifacts but publishes nothing.
+# Pushing a tag like v0.2.0 builds the prebuilt binaries (Linux x86_64, macOS
+# arm64 and x86_64) and publishes them with SHA256SUMS as a GitHub release.
+# Running it by hand (workflow_dispatch) is a dry run: it builds and uploads
+# the same files as workflow artifacts but publishes nothing.
 on:
   push:
     tags: ['v*']
@@ -31,9 +32,18 @@ jobs:
           # On 24.04 (2.39) it installed fine on Debian 12 and failed to start.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          # Linux only: the app reads /proc, which macOS doesn't have, so a
-          # macOS binary would install fine and show empty tables.
+          # macOS (libproc + lsof backend). Both built on the Apple Silicon
+          # runner; the Intel one is a cross build, so it is compiled but
+          # not run here.
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15
+            target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
+    env:
+      # Oldest macOS the binaries promise to start on (Big Sur); ignored on
+      # Linux.
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -60,10 +70,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
 
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          targets: ${{ matrix.target }}
 
       # No build cache: a release binary is always built from a clean tree.
 
-      - run: cargo build --release --locked
+      - run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
@@ -72,11 +84,16 @@ jobs:
         run: |
           name="vt-lens-${RELEASE_TAG}-${TARGET}"
           mkdir -p "dist/$name"
-          cp target/release/vt-lens "dist/$name/"
-          for f in README.md LICENSE vt-lens.desktop; do
+          cp "target/$TARGET/release/vt-lens" "dist/$name/"
+          files="README.md LICENSE CHANGELOG.md"
+          # The desktop launcher is for Linux menus only.
+          case "$TARGET" in *-linux-*) files="$files vt-lens.desktop" ;; esac
+          for f in $files; do
             if [ -f "$f" ]; then cp "$f" "dist/$name/"; fi
           done
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          file "dist/$name/vt-lens"
+          # COPYFILE_DISABLE: no AppleDouble (._*) entries from macOS tar.
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/$name.tar.gz" "$name"
           rm -rf "dist/$name"
           ls -l dist
 
