@@ -1,6 +1,9 @@
 //! Linux sockets: `/proc/net/{tcp,udp,tcp6,udp6}` list every socket by inode,
 //! and `/proc/<pid>/fd/*` links (`socket:[inode]`) tie each inode to a process.
 
+// On macOS this module is compiled only for its unit tests.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;

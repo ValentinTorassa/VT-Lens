@@ -2,12 +2,21 @@
 //!
 //! Each backend reads its operating system with the user's own privileges and
 //! hands the UI a [`Snapshot`]; nothing else in the app knows which one ran.
-//! - Linux: `/proc`, see [`procfs`].
+//! - Linux (and any other non-macOS build): `/proc`, see [`procfs`].
+//! - macOS: libproc through `sysinfo` for processes and `lsof` for sockets,
+//!   see [`macos`].
 //! - Demo mode: a fixed synthetic dataset, see [`demo`].
 
 mod demo;
+#[cfg(any(target_os = "macos", test))]
+mod lsof;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(any(not(target_os = "macos"), test))]
 mod net_poller;
+#[cfg(any(not(target_os = "macos"), test))]
 mod proc_poller;
+#[cfg(not(target_os = "macos"))]
 mod procfs;
 
 pub use demo::HOSTNAMES as DEMO_HOSTNAMES;
@@ -87,7 +96,14 @@ pub trait CaptureSource: Send {
 
 /// The backend for the machine this binary runs on.
 pub fn system_source() -> Box<dyn CaptureSource> {
-    Box::new(procfs::ProcSource)
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(macos::MacSource::new())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Box::new(procfs::ProcSource)
+    }
 }
 
 /// Synthetic data shaped like a capture on `platform`.

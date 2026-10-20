@@ -1,5 +1,8 @@
 //! Linux processes: one `/proc/<pid>` directory each (`comm`, `cmdline`, `status`).
 
+// On macOS this module is compiled only for its unit tests.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
+
 use std::fs;
 use std::path::Path;
 

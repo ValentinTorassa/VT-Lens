@@ -3,6 +3,10 @@ use std::process::{Command, Stdio};
 
 const APP: &str = "vt-lens";
 
+/// The keyring goes through `secret-tool` (libsecret, the Secret Service on
+/// Linux desktops). macOS has neither; the Keychain is not wired in yet.
+pub const AVAILABLE: bool = cfg!(not(target_os = "macos"));
+
 pub enum Action {
     Load,
     Save(String),

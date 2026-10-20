@@ -295,9 +295,10 @@ impl VtLensApp {
         app
     }
 
-    /// Demo mode never touches the OS keyring (safe screenshots).
+    /// Demo mode never touches the OS keyring (safe screenshots), and macOS
+    /// has no `secret-tool`; there the key is pasted for the session only.
     fn keyring_enabled(&self) -> bool {
-        !self.demo_mode
+        !self.demo_mode && keyring::AVAILABLE
     }
 
     /// Ask the polling thread for a snapshot now.
@@ -1526,6 +1527,8 @@ impl VtLensApp {
                     });
                     if self.demo_mode {
                         ui.label(RichText::new("Modo demo: el llavero del sistema está desactivado.").small().weak());
+                    } else if !keyring::AVAILABLE {
+                        ui.label(RichText::new("El llavero todavía solo funciona en Linux: la clave vale para esta sesión.").small().weak());
                     }
                     if !self.keyring_status.is_empty() {
                         ui.label(RichText::new(&self.keyring_status).small().weak());
