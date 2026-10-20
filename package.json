@@ -1,7 +1,7 @@
 {
   "name": "vt-lens",
-  "version": "0.1.3",
-  "description": "Local system visibility - /proc based native tool",
+  "version": "0.2.0",
+  "description": "Local system visibility - native tool for Linux (/proc) and macOS (libproc + lsof)",
   "bin": {
     "vt-lens": "bin/vt-lens"
   },
@@ -16,6 +16,7 @@
     "observability",
     "security",
     "linux",
+    "macos",
     "network",
     "sockets"
   ],
