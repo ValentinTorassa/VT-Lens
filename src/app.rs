@@ -534,7 +534,8 @@ impl VtLensApp {
         let visibility = match self.platform {
             Platform::Linux => "",
             Platform::MacOs => {
-                "* Without root, lsof only lists sockets of the user's own processes; other users' and root's sockets are missing\n"
+                "* Without root, lsof only lists sockets of the user's own processes; other users' and root's sockets are missing\n\
+                 * Without root, other users' processes report 0 MB, 0 threads and an unknown state: macOS hides those values, they are not real zeros\n"
             }
         };
         let mut prompt = format!(
@@ -1694,6 +1695,7 @@ fn source_notes(platform: Platform) -> &'static [&'static str] {
         Platform::MacOs => &[
             "• macOS no tiene /proc: VT Lens lista los procesos con libproc y los sockets TCP/UDP con lsof.",
             "• Sin sudo, lsof solo ve los sockets de tus propios procesos; los de root y otros usuarios no aparecen. netstat -anv sí los lista con proceso:pid.",
+            "• De los procesos de otros usuarios (root incluido) macOS solo muestra nombre, PID y usuario sin sudo: su memoria y threads aparecen en 0 y su estado como ?.",
         ],
     }
 }
