@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, RichText, TextEdit};
 
 use crate::capture::{self, CaptureSource, Platform, Snapshot};
+use crate::comparison::{Capture as ComparisonCapture, Comparison};
 use crate::evidence::{self, EndpointClass, EvidenceInput};
 use crate::keyring::{self, Action as KeyringAction, Outcome as KeyringOutcome};
 use crate::model::{NetRow, ProcessRow, SocketId};
@@ -108,8 +109,12 @@ pub struct VtLensApp {
     auto_refresh: bool,
     /// A manual refresh is applied even while auto refresh is paused.
     refresh_requested: bool,
+    comparison_before: Option<ComparisonCapture>,
+    comparison: Option<Comparison>,
+    comparison_requested: Option<Instant>,
+    comparison_open: bool,
     tx_refresh: std::sync::mpsc::Sender<()>,
-    rx_snapshot: std::sync::mpsc::Receiver<Snapshot>,
+    rx_snapshot: std::sync::mpsc::Receiver<(Instant, Snapshot)>,
     // LLM Analysis Integration
     api_key: String,
     keyring_status: String,
@@ -192,7 +197,8 @@ impl VtLensApp {
             while let Ok(()) | Err(RecvTimeoutError::Timeout) =
                 rx_refresh.recv_timeout(POLL_INTERVAL)
             {
-                if tx_snapshot.send(source.capture()).is_err() {
+                let started = Instant::now();
+                if tx_snapshot.send((started, source.capture())).is_err() {
                     break;
                 }
                 ctx_clone.request_repaint(); // immediately trigger repaint in the GUI thread
@@ -263,6 +269,10 @@ impl VtLensApp {
             demo_mode,
             auto_refresh: true,
             refresh_requested: false,
+            comparison_before: None,
+            comparison: None,
+            comparison_requested: None,
+            comparison_open: false,
             tx_refresh,
             rx_snapshot,
             api_key: String::new(),
@@ -616,6 +626,44 @@ impl VtLensApp {
                 }
                 ui.checkbox(&mut self.auto_refresh, "Auto refresh");
             });
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("1. Guardar antes").clicked() {
+                self.comparison_before = Some(ComparisonCapture::new(
+                    &self.processes,
+                    &self.connections,
+                    self.last_snapshot_time,
+                ));
+                self.comparison = None;
+                self.comparison_requested = None;
+            }
+            if ui
+                .add_enabled(
+                    self.comparison_before.is_some() && self.comparison_requested.is_none(),
+                    egui::Button::new("2. Capturar después"),
+                )
+                .clicked()
+            {
+                self.comparison_requested = Some(Instant::now());
+                self.request_refresh();
+            }
+            if self.comparison_requested.is_some() {
+                ui.label("Capturando…");
+            } else if let Some(before) = &self.comparison_before {
+                ui.label(format!(
+                    "Antes guardado hace {:.0} s · solo esta sesión",
+                    before.at.elapsed().as_secs_f64()
+                ));
+            }
+            if self.comparison.is_some() && ui.button("Ver comparación").clicked() {
+                self.comparison_open = true;
+            }
+            if self.comparison_before.is_some() && ui.small_button("Limpiar").clicked() {
+                self.comparison_before = None;
+                self.comparison = None;
+                self.comparison_requested = None;
+                self.comparison_open = false;
+            }
         });
     }
 
@@ -1712,14 +1760,33 @@ impl eframe::App for VtLensApp {
         let prev_only_active = self.only_network_active;
 
         // Poll for snapshots from background thread
-        if let Ok(snapshot) = self.rx_snapshot.try_recv()
+        if let Ok((started, snapshot)) = self.rx_snapshot.try_recv()
             && (self.auto_refresh || self.refresh_requested)
         {
-            self.refresh_requested = false;
+            self.refresh_requested = self
+                .comparison_requested
+                .is_some_and(|requested| started < requested);
             self.processes = snapshot.processes;
             self.connections = snapshot.connections;
             self.status = snapshot.status;
             self.last_snapshot_time = Instant::now();
+            if self
+                .comparison_requested
+                .is_some_and(|requested| started >= requested)
+            {
+                self.comparison_requested = None;
+                if let Some(before) = &self.comparison_before {
+                    self.comparison = Some(Comparison::between(
+                        before,
+                        &ComparisonCapture::new(
+                            &self.processes,
+                            &self.connections,
+                            self.last_snapshot_time,
+                        ),
+                    ));
+                    self.comparison_open = true;
+                }
+            }
             self.update_caches();
         }
 
@@ -1767,6 +1834,27 @@ impl eframe::App for VtLensApp {
         }
 
         ctx.request_repaint_after(Duration::from_millis(500));
+
+        if let Some(comparison) = &self.comparison {
+            egui::Window::new("Antes / después")
+                .open(&mut self.comparison_open)
+                .default_width(680.0)
+                .default_height(460.0)
+                .show(&ctx, |ui| {
+                    ui.label(
+                        "Comparación fija de dos capturas. Podés seguir refrescando sin cambiarla.",
+                    );
+                    ui.label("Términos privados adicionales (separados por coma):");
+                    ui.text_edit_singleline(&mut self.private_terms);
+                    let markdown = comparison.markdown(&self.private_terms);
+                    if ui.button("Copiar comparación redactada").clicked() {
+                        ui.ctx().copy_text(markdown.clone());
+                    }
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.label(RichText::new(markdown).monospace());
+                    });
+                });
+        }
 
         // Header Panel
         egui::Panel::top("header")

@@ -81,5 +81,29 @@ fn screenshots() {
     });
 }
 
+#[test]
+fn comparison_screenshot() {
+    render("comparison", |harness| {
+        let app = harness.state_mut();
+        let at = std::time::Instant::now();
+        let before = crate::comparison::Capture::new(&app.processes, &app.connections, at);
+        let mut after = crate::comparison::Capture::new(
+            &app.processes,
+            &app.connections,
+            at + std::time::Duration::from_secs(15),
+        );
+        after.connections.remove(0);
+        after.processes.push(crate::model::ProcessRow {
+            pid: 9001,
+            name: "demo-client".into(),
+            start_id: Some(1),
+            ..Default::default()
+        });
+        app.comparison = Some(crate::comparison::Comparison::between(&before, &after));
+        app.comparison_before = Some(before);
+        app.comparison_open = true;
+    });
+}
+
 /// 100 points each, past the label so the Markdown text shows too.
 const SCROLL_STEPS: usize = 3;

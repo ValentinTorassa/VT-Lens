@@ -3,6 +3,8 @@ use std::fmt;
 #[derive(Clone, Debug, Default)]
 pub struct ProcessRow {
     pub pid: u32,
+    /// Start ticks on Linux, epoch seconds on macOS; compared only within this session.
+    pub start_id: Option<u64>,
     pub name: String,
     pub cmdline: String,
     pub state: String,

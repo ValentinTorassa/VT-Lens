@@ -499,6 +499,7 @@ mod tests {
     fn evidence_carries_only_allowlisted_fields() {
         let processes = vec![ProcessRow {
             pid: 4242,
+            start_id: Some(1),
             name: "agent".into(),
             cmdline:
                 "agent --token=CANARY-TOKEN /home/alice/secret-project OPENAI_API_KEY=CANARY-KEY"
