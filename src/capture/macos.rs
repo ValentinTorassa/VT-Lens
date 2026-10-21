@@ -65,6 +65,7 @@ impl CaptureSource for MacSource {
                 let task = task_info(pid);
                 ProcessRow {
                     pid,
+                    start_id: (process.start_time() > 0).then_some(process.start_time()),
                     cmdline: if cmdline.is_empty() {
                         name.clone()
                     } else {

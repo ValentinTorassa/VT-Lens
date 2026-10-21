@@ -154,6 +154,16 @@ cargo install --path .
   you press **2. Enviar a IA**.
 - Markdown evidence preview for labs, writeups, and videos, built from the
   same allowlist as the prompt.
+- Antes/después: **1. Guardar antes** conserva la captura visible y
+  **2. Capturar después** toma una nueva. La comparación queda fija aunque
+  continúe el refresco: procesos y sockets nuevos, los que dejaron de verse
+  y cambios de estado. **Copiar comparación redactada** usa la misma
+  selección de campos y términos privados que la evidencia, sin enviarla a IA.
+  Ambas capturas viven solo en memoria y se borran con **Limpiar** o al cerrar.
+  No muestra actividad entre capturas ni demuestra que una desaparición sea
+  un cierre. Si el sistema oculta el inicio de un proceso, un PID reutilizado
+  puede resultar indistinguible.
+  [Ejemplo con datos sintéticos](docs/screenshots/comparison.png).
 
 ---
 

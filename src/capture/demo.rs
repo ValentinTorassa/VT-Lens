@@ -200,6 +200,7 @@ impl CaptureSource for DemoSource {
             .iter()
             .map(
                 |&(pid, name, cmdline, rss_kb, threads, uid_class)| ProcessRow {
+                    start_id: Some(u64::from(pid)),
                     pid,
                     name: if pid == 1 && self.platform == Platform::MacOs {
                         "launchd".into()

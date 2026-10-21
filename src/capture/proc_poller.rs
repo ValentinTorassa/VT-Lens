@@ -35,6 +35,9 @@ pub fn read_processes() -> Vec<ProcessRow> {
 
         rows.push(ProcessRow {
             pid,
+            start_id: fs::read_to_string(proc_dir.join("stat"))
+                .ok()
+                .and_then(|s| parse_start_id(&s)),
             name,
             cmdline,
             state: parse_status_string(&status, "State").unwrap_or_default(),
@@ -54,6 +57,16 @@ fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
         .ok()
         .map(|value| strip_control(value.trim()).trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn parse_start_id(stat: &str) -> Option<u64> {
+    // comm (field 2) may contain spaces and parentheses; field 22 is starttime.
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
 }
 
 fn read_cmdline(path: impl AsRef<Path>) -> Option<String> {
@@ -122,6 +135,19 @@ mod tests {
             parse_status_uid("Uid:\t1000\t1000\t1000\t1000\n"),
             Some(1000)
         );
+    }
+
+    #[test]
+    fn process_start_id_handles_parentheses_in_comm() {
+        let tail = (3..=21)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            parse_start_id(&format!("42 (name with ) parentheses) {tail} 999 23")),
+            Some(999)
+        );
+        assert_eq!(parse_start_id("invalid"), None);
     }
 
     #[test]
