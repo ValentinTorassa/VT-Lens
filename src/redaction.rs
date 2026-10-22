@@ -140,8 +140,8 @@ mod tests {
     use super::{redact, redact_with_terms};
 
     fn assert_hidden(clean: &str, secrets: &[&str]) {
-        for secret in secrets {
-            assert!(!clean.contains(secret), "leaked {secret:?} in:\n{clean}");
+        for (index, secret) in secrets.iter().enumerate() {
+            assert!(!clean.contains(secret), "redaction missed case {index}");
         }
     }
 
