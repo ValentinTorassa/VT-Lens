@@ -151,7 +151,7 @@ nix run github:Jupamohi/vt-lens-nix -- --demo   # datos sintéticos
 
 Instalar en tu perfil de usuario:
 ```bash
-nix profile install github:Jupamohi/vt-lens-nix
+nix profile add github:Jupamohi/vt-lens-nix
 ```
 
 Instalar en NixOS, dentro de la configuración basada en flakes:
