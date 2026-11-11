@@ -137,6 +137,49 @@ Si tienes el entorno de desarrollo de Rust configurado y quieres compilar e inst
 ```bash
 cargo install --path .
 ```
+---
+
+### 7. Nix / NixOS
+
+Si usas Nix (con flakes activados) o NixOS, puedes compilar VT Lens desde el código fuente con un flake de la comunidad: [`Jupamohi/vt-lens-nix`](https://github.com/Jupamohi/vt-lens-nix). La primera vez compila Rust desde cero, así que tarda unos minutos.
+
+Ese flake **no es parte de este proyecto**: lo mantiene [@Jupamohi](https://github.com/Jupamohi) y fija una versión concreta de VT Lens (hoy, el tag `v0.3.0`). Para saber qué versión vas a instalar, mira el input `vt-lens-src` en su [`flake.nix`](https://github.com/Jupamohi/vt-lens-nix/blob/main/flake.nix). Los problemas del empaquetado van a su repositorio.
+
+Ejecutar sin instalar:
+```bash
+nix run github:Jupamohi/vt-lens-nix
+nix run github:Jupamohi/vt-lens-nix -- --demo   # datos sintéticos
+```
+
+Instalar en tu perfil de usuario:
+```bash
+nix profile add github:Jupamohi/vt-lens-nix
+```
+
+Instalar en NixOS, dentro de la configuración basada en flakes:
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    vt-lens-nix.url = "github:Jupamohi/vt-lens-nix";
+    vt-lens-nix.inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = { nixpkgs, vt-lens-nix, ... }: {
+    nixosConfigurations.mi-equipo = nixpkgs.lib.nixosSystem {
+      modules = [
+        ({ pkgs, ... }: {
+          environment.systemPackages = [
+            vt-lens-nix.packages.${pkgs.stdenv.hostPlatform.system}.default
+          ];
+        })
+      ];
+    };
+  };
+}
+```
+
+El paquete añade el lanzador `vt-lens.desktop` y deja `secret-tool` (libsecret) disponible para el botón **Guardar en llavero**.
 
 ---
 
